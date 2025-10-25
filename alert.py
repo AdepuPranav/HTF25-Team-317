@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import uvicorn
 import cv2
 import tempfile
 import os
+import time
 from typing import Dict, List
 from collections import deque
 import time
@@ -51,6 +52,14 @@ def _record_alert(source: str, count: int, density_per_mp: float, panic_index: f
         "severity": severity,
         "message": f"{severity}: density={density_per_mp:.2f}/MP, panic={panic_index:.2f}, count={count}"
     }
+
+# In-memory location configs keyed by filename.
+# Each config: {"location_id": str, "area_m2": float, "roi": List[[x,y], ...], "lat": float, "lon": float}
+LOCATION_CONFIGS: Dict[str, Dict[str, object]] = {}
+
+# Global live metrics per filename for map/dashboard
+# { filename: { ts, location_id, count, density_mp, density_m2 (optional), lat, lon, severity } }
+GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
 
 @app.get("/")
 async def root():
@@ -225,7 +234,7 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
     area_mp = (width * height) / 1_000_000.0 if width and height else 0.0
     avg_density_per_mp = (avg_per_frame / area_mp) if area_mp else 0.0
     max_density_per_mp = (max_in_frame / area_mp) if area_mp else 0.0
-    return {
+    out = {
         "file": os.path.basename(path),
         "resolution": {"width": width, "height": height},
         "fps": round(fps, 3) if fps else None,
@@ -239,12 +248,43 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
         "avg_density_per_mp": round(avg_density_per_mp, 3),
         "max_density_per_mp": round(max_density_per_mp, 3)
     }
+    # If we have a location config for this filename, include true density per m^2 using average count
+    fname = out["file"]
+    cfg = LOCATION_CONFIGS.get(fname)
+    if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
+        area_m2 = float(cfg["area_m2"])  # user-provided calibrated area
+        out["avg_density_per_m2"] = round((avg_per_frame / area_m2), 3)
+        out["max_density_per_m2"] = round((max_in_frame / area_m2), 3)
+        out["location_id"] = cfg.get("location_id")
+    return out
 
 @app.get("/videos/demo")
 async def list_demo_videos():
     items = _list_demo_videos()
     if not items:
         return JSONResponse({"videos": [], "message": "No non-empty demo videos found in current directory."})
+    # Auto-geotag first two non-empty videos if not present
+    try:
+        if len(items) >= 1:
+            f0 = items[0]["filename"]
+            cfg0 = LOCATION_CONFIGS.get(f0, {})
+            if "location_id" not in cfg0: cfg0["location_id"] = "Secunderabad Railway Station"
+            if "area_m2" not in cfg0: cfg0["area_m2"] = 1000.0
+            if "roi" not in cfg0: cfg0["roi"] = []
+            if "lat" not in cfg0: cfg0["lat"] = 17.4399
+            if "lon" not in cfg0: cfg0["lon"] = 78.4983
+            LOCATION_CONFIGS[f0] = cfg0
+        if len(items) >= 2:
+            f1 = items[1]["filename"]
+            cfg1 = LOCATION_CONFIGS.get(f1, {})
+            if "location_id" not in cfg1: cfg1["location_id"] = "Uppal, Telangana"
+            if "area_m2" not in cfg1: cfg1["area_m2"] = 1000.0
+            if "roi" not in cfg1: cfg1["roi"] = []
+            if "lat" not in cfg1: cfg1["lat"] = 17.4056
+            if "lon" not in cfg1: cfg1["lon"] = 78.5596
+            LOCATION_CONFIGS[f1] = cfg1
+    except Exception:
+        pass
     return JSONResponse({"videos": items})
 
 @app.post("/videos/analyze/demo")
@@ -291,6 +331,7 @@ def _severity_for_density(density_per_mp: float) -> str:
     return "CRITICAL"
 
 def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog', source_label: str = "stream"):
+
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         yield b""
@@ -298,8 +339,12 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
     hog = _hog_detector() if detector != 'yolo' else None
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     idx = 0
+
     panic_window = int(CONFIG.get("panic_window", 10) or 10)
     recent_counts: deque = deque(maxlen=panic_window)
+
+    filename = os.path.basename(path)
+    cfg = LOCATION_CONFIGS.get(filename)
     try:
         while True:
             ret, frame = cap.read()
@@ -318,8 +363,18 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 rects = _hog_detect(frame, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
             count = 0
             if rects:
-                count = len(rects)
-                for (x, y, w, h) in rects:
+                # If ROI is defined, filter boxes whose center lies inside ROI
+                roi = cfg.get("roi") if cfg else None
+                filtered = []
+                if roi and isinstance(roi, list) and len(roi) >= 3:
+                    for (x, y, w, h) in rects:
+                        cx, cy = x + w // 2, y + h // 2
+                        if _point_in_polygon(cx, cy, roi):
+                            filtered.append((x, y, w, h))
+                else:
+                    filtered = rects
+                count = len(filtered)
+                for (x, y, w, h) in filtered:
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
             # Overlay banner with severity and count
@@ -344,11 +399,54 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 _record_alert(source_label, count, dens, panic, sev_label)
 
             label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP | Panic: {panic:.2f}"
+            # If location config includes true area, show people per m^2
+            if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
+                area_m2 = float(cfg["area_m2"])
+                dens_m2 = (count / area_m2) if area_m2 > 0 else 0.0
+                label += f" | {dens_m2:.2f}/m^2"
+
             cv2.putText(frame, label, (10, int(banner_h * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             # Optional timestamp/second estimate
             if fps and fps > 0:
                 sec = int(idx / fps)
                 cv2.putText(frame, f"t={sec}s", (w - 90, int(banner_h * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Draw ROI polygon if configured
+            if cfg and isinstance(cfg.get("roi"), list) and len(cfg["roi"]) >= 3:
+                pts = cfg["roi"]
+                poly = [(int(px), int(py)) for (px, py) in pts]
+                # Use numpy if available to draw filled polygon with transparency
+                try:
+                    import numpy as np  # local import to avoid top-level change
+                    overlay2 = frame.copy()
+                    cv2.fillPoly(overlay2, [np.array(poly, dtype=np.int32)], color=(255, 255, 0))
+                    frame = cv2.addWeighted(overlay2, 0.15, frame, 0.85, 0)
+                    cv2.polylines(frame, [np.array(poly, dtype=np.int32)], isClosed=True, color=(255, 255, 0), thickness=2)
+                except Exception:
+                    # Fallback: draw just polyline without fill
+                    for i in range(len(poly)):
+                        p1 = poly[i]
+                        p2 = poly[(i + 1) % len(poly)]
+                        cv2.line(frame, p1, p2, (255, 255, 0), 2)
+
+            # Publish live metrics for map/dashboard
+            loc_id = cfg.get("location_id") if cfg else filename
+            lat = cfg.get("lat") if cfg else None
+            lon = cfg.get("lon") if cfg else None
+            payload = {
+                "ts": int(time.time()),
+                "filename": filename,
+                "location_id": loc_id,
+                "count": int(count),
+                "density_mp": round(float(dens), 3),
+                "severity": _severity_for_count(count)["label"],
+            }
+            if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
+                payload["density_m2"] = round((count / float(cfg["area_m2"])) if float(cfg["area_m2"]) > 0 else 0.0, 3)
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                payload["lat"] = float(lat)
+                payload["lon"] = float(lon)
+            GLOBAL_METRICS[filename] = payload
 
             ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
             if not ok:
@@ -380,8 +478,8 @@ async def dashboard():
     <!doctype html>
     <html>
     <head>
-      <meta charset=\"utf-8\" />
-      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>Crowd Demo Dashboard</title>
       <style>
         body { font-family: system-ui, sans-serif; margin: 20px; }
@@ -398,33 +496,44 @@ async def dashboard():
         #alertBox.critical { background:#c62828; }
         #cfg { margin: 14px 0; padding:10px; border:1px solid #eee; border-radius:8px; }
         #cfg label { margin-right: 10px; }
+        #map { height: 420px; margin-top: 16px; border: 1px solid #ddd; border-radius: 6px; }
+        .sev-safe { color: #1a7f37; }
+        .sev-moderate { color: #b58900; }
+        .sev-critical { color: #d73a49; }
       </style>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
+      <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
     </head>
     <body>
       <h2>Crowd Detection - Demo Videos</h2>
-      <div id=\"alertBox\"></div>
-      <div id=\"list\">Loading...</div>
-      <div id=\"controls\">
-        <label>Detector: <select id=\"det\"><option value=\"hog\" selected>HOG</option><option value=\"yolo\">YOLOv8</option></select></label>
-        <label>Frame stride: <input id=\"stride\" type=\"number\" value=\"2\" min=\"1\" max=\"10\" /></label>
-        <button id=\"start\">Start Selected (max 3)</button>
-        <button id=\"stop\">Stop All</button>
+      <div id="alertBox"></div>
+      <div id="list">Loading...</div>
+      <div id="controls">
+        <label>Detector: <select id="det"><option value="hog" selected>HOG</option><option value="yolo">YOLOv8</option></select></label>
+        <label>Frame stride: <input id="stride" type="number" value="2" min="1" max="10" /></label>
+        <button id="start">Start Selected (max 3)</button>
+        <button id="stop">Stop All</button>
       </div>
-      <div id=\"cfg\">
+      <div id="cfg">
         <strong>Alerts Config</strong>
-        <div style=\"margin-top:8px\">
-          <label>Density thr: <input id=\"cfg_density\" type=\"number\" step=\"0.1\"/></label>
-          <label>Panic thr: <input id=\"cfg_panic\" type=\"number\" step=\"0.05\" min=\"0\" max=\"1\"/></label>
-          <label>Panic window: <input id=\"cfg_window\" type=\"number\" min=\"3\" max=\"60\"/></label>
-          <label>Panic scale: <input id=\"cfg_scale\" type=\"number\" step=\"0.1\" min=\"1\"/></label>
-          <button id=\"cfg_save\">Save</button>
+        <div style="margin-top:8px">
+          <label>Density thr: <input id="cfg_density" type="number" step="0.1"/></label>
+          <label>Panic thr: <input id="cfg_panic" type="number" step="0.05" min="0" max="1"/></label>
+          <label>Panic window: <input id="cfg_window" type="number" min="3" max="60"/></label>
+          <label>Panic scale: <input id="cfg_scale" type="number" step="0.1" min="1"/></label>
+          <button id="cfg_save">Save</button>
         </div>
       </div>
-      <div class=\"grid\">
-        <div class=\"panel\"><h4 id=\"t1\">Panel 1</h4><img id=\"p1\" src=\"\" alt=\"panel1\" /></div>
-        <div class=\"panel\"><h4 id=\"t2\">Panel 2</h4><img id=\"p2\" src=\"\" alt=\"panel2\" /></div>
-        <div class=\"panel\"><h4 id=\"t3\">Panel 3</h4><img id=\"p3\" src=\"\" alt=\"panel3\" /></div>
+      <div class="grid">
+        <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
+        <div class="panel"><h4 id="t2">Panel 2</h4><img id="p2" src="" alt="panel2" /></div>
+        <div class="panel"><h4 id="t3">Panel 3</h4><img id="p3" src="" alt="panel3" /></div>
       </div>
+
+      <h3>Live Congestion Map (OSM + OSRM)</h3>
+      <div id="map"></div>
       <script>
         let videos = [];
         let lastAlertTime = null;
@@ -514,6 +623,67 @@ async def dashboard():
         load();
         loadConfig();
         setInterval(pollAlerts, 2000);
+
+        // OSM + OSRM map setup
+        const map = L.map('map').setView([20.5937, 78.9629], 5); // India center
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        const markers = new Map();
+        let router = null;
+        let selected = [];
+
+        function sevClass(label){
+          if(label === 'CRITICAL') return 'sev-critical';
+          if(label === 'MODERATE') return 'sev-moderate';
+          return 'sev-safe';
+        }
+
+        function sevColor(label){
+          if(label === 'CRITICAL') return '#d73a49';
+          if(label === 'MODERATE') return '#b58900';
+          return '#1a7f37';
+        }
+
+        async function poll(){
+          try{
+            const r = await fetch('/congestion');
+            const j = await r.json();
+            if(!j.items) return;
+            j.items.forEach(it => {
+              if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
+              const key = it.filename;
+              const html = `<b>${it.location_id || key}</b><br/>`+
+                `<span class="${sevClass(it.severity)}">${it.severity}</span><br/>`+
+                `Count: ${it.count}<br/>`+
+                `Density: ${(it.density_mp??0).toFixed(2)}/MP` + (it.density_m2? `<br/>${it.density_m2.toFixed(2)}/m²` : '');
+              const radius = Math.min(30, 6 + (it.count||0));
+              const color = sevColor(it.severity);
+              if(markers.has(key)){
+                const { marker } = markers.get(key);
+                marker.setLatLng([it.lat, it.lon]);
+                marker.setStyle({ color, fillColor: color, radius });
+                marker.bindPopup(html);
+              } else {
+                const marker = L.circleMarker([it.lat, it.lon], { radius, color, fillColor: color, fillOpacity: 0.7, weight: 2 }).addTo(map).bindPopup(html);
+                marker.on('click', () => {
+                  if(selected.length === 2){ selected = []; if(router){ map.removeControl(router); router=null; } }
+                  selected.push([it.lat, it.lon]);
+                  if(selected.length === 2){
+                    router = L.Routing.control({
+                      waypoints: [ L.latLng(selected[0][0], selected[0][1]), L.latLng(selected[1][0], selected[1][1]) ],
+                      routeWhileDragging: false,
+                    }).addTo(map);
+                  }
+                });
+                markers.set(key, { marker });
+              }
+            });
+          }catch(e){/* ignore */}
+          setTimeout(poll, 3000);
+        }
+        poll();
       </script>
     </body>
     </html>
@@ -569,7 +739,13 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
     for s in sorted(per_sec.keys()):
         cnt = per_sec[s]
         dens = (cnt / area_mp) if area_mp else 0.0
-        series.append({"second": s, "count": cnt, "density_per_mp": round(dens, 3)})
+
+        item = {"second": s, "count": cnt, "density_per_mp": round(dens, 3)}
+        cfg = LOCATION_CONFIGS.get(filename)
+        if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
+            area_m2 = float(cfg["area_m2"])
+            item["density_per_m2"] = round((cnt / area_m2), 3) if area_m2 > 0 else 0.0
+        series.append(item)
     # Basic alert check on aggregate (max density over seconds)
     if series:
         max_dens = max(p["density_per_mp"] for p in series)
@@ -600,6 +776,83 @@ async def alerts_set_config(density_threshold: float = None, panic_threshold: fl
     if panic_scale is not None and float(panic_scale) > 0:
         CONFIG["panic_scale"] = float(panic_scale)
     return JSONResponse({"config": CONFIG})
+
+@app.get("/locations")
+async def get_locations():
+    return JSONResponse({"locations": LOCATION_CONFIGS})
+
+@app.post("/locations/set")
+async def set_location(
+    filename: str = Body(...),
+    area_m2: float = Body(...),
+    location_id: str | None = Body(None),
+    roi: List[List[int]] | None = Body(None)
+):
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename required")
+    if not area_m2 or area_m2 <= 0:
+        raise HTTPException(status_code=400, detail="area_m2 must be > 0")
+    if roi and (not isinstance(roi, list) or len(roi) < 3):
+        raise HTTPException(status_code=400, detail="roi must be list of at least 3 [x,y] points")
+    LOCATION_CONFIGS[filename] = {
+        "location_id": location_id or filename,
+        "area_m2": float(area_m2),
+        "roi": roi or []
+    }
+    return JSONResponse({"ok": True, "config": LOCATION_CONFIGS[filename]})
+
+@app.post("/locations/geotag")
+async def geotag_location(filename: str = Body(...), lat: float = Body(...), lon: float = Body(...)):
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename required")
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        raise HTTPException(status_code=400, detail="lat/lon must be numbers")
+    cfg = LOCATION_CONFIGS.get(filename, {"location_id": filename, "area_m2": 0.0, "roi": []})
+    cfg["lat"], cfg["lon"] = float(lat), float(lon)
+    LOCATION_CONFIGS[filename] = cfg
+    return JSONResponse({"ok": True, "config": cfg})
+
+@app.delete("/locations/delete")
+async def delete_location(filename: str):
+    if filename in LOCATION_CONFIGS:
+        del LOCATION_CONFIGS[filename]
+        return JSONResponse({"ok": True})
+    raise HTTPException(status_code=404, detail="filename not configured")
+
+@app.get("/congestion")
+async def congestion_feed():
+    # Return live metrics for map/dashboard.
+    # Merge current metrics with any geotagged locations so markers always show.
+    merged: Dict[str, Dict[str, object]] = {}
+    for k, v in GLOBAL_METRICS.items():
+        merged[k] = dict(v)
+    for fname, cfg in LOCATION_CONFIGS.items():
+        lat = cfg.get("lat")
+        lon = cfg.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            if fname not in merged:
+                merged[fname] = {
+                    "ts": int(time.time()),
+                    "filename": fname,
+                    "location_id": cfg.get("location_id") or fname,
+                    "count": 0,
+                    "density_mp": 0.0,
+                    "severity": "SAFE",
+                    "lat": float(lat),
+                    "lon": float(lon),
+                }
+                if isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
+                    merged[fname]["density_m2"] = 0.0
+            else:
+                # Ensure lat/lon present in live metric if config has it
+                itm = merged[fname]
+                if "lat" not in itm:
+                    itm["lat"] = float(lat)
+                if "lon" not in itm:
+                    itm["lon"] = float(lon)
+                if "location_id" not in itm:
+                    itm["location_id"] = cfg.get("location_id") or fname
+    return JSONResponse({"items": list(merged.values())})
 
 if __name__ == "__main__":
     # For local testing: python main.py
