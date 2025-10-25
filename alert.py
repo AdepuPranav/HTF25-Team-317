@@ -22,7 +22,13 @@ CONFIG: Dict[str, float] = {
     "density_threshold": 12.0,  # people per megapixel
     "panic_threshold": 0.7,     # 0..1
     "panic_window": 10,         # frames for trend estimation
-    "panic_scale": 8.0          # normalization for change magnitude
+    "panic_scale": 8.0,         # normalization for change magnitude
+    "predict_window_sec": 30.0,
+    "predict_horizon_sec": 10.0,
+    "predict_alert_enabled": 1.0,
+    "alert_cooldown_sec": 15.0,
+    "ema_alpha": 0.2,
+    "z_threshold": 2.5
 }
 
 ALERT_STATE: Dict[str, object] = {
@@ -60,6 +66,8 @@ LOCATION_CONFIGS: Dict[str, Dict[str, object]] = {}
 # Global live metrics per filename for map/dashboard
 # { filename: { ts, location_id, count, density_mp, density_m2 (optional), lat, lon, severity } }
 GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
+
+LAST_ALERT_TS: Dict[str, int] = {}
 
 @app.get("/")
 async def root():
@@ -364,6 +372,11 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
 
     filename = os.path.basename(path)
     cfg = LOCATION_CONFIGS.get(filename)
+    counts_per_sec: Dict[int, int] = {}
+    recent_sec_counts: deque = deque(maxlen=int(CONFIG.get("predict_window_sec", 30)))
+    last_sec = None
+    ema_alpha = float(CONFIG.get("ema_alpha", 0.2) or 0.2)
+    ema_count = None
     try:
         while True:
             ret, frame = cap.read()
@@ -418,7 +431,25 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             panic_thr = CONFIG.get("panic_threshold", 0.7)
             if (dens > density_thr) or (panic > panic_thr):
                 sev_label = _severity_for_density(dens)
-                _record_alert(source_label, count, dens, panic, sev_label)
+                now_ts = int(time.time())
+                cooldown = int(CONFIG.get("alert_cooldown_sec", 15) or 15)
+                last_ts = LAST_ALERT_TS.get(filename, 0)
+                if now_ts - last_ts >= cooldown:
+                    _record_alert(source_label, count, dens, panic, sev_label)
+                    LAST_ALERT_TS[filename] = now_ts
+
+            sec = int(idx / fps) if fps and fps > 0 else 0
+            counts_per_sec[sec] = counts_per_sec.get(sec, 0) + count
+            if last_sec is None:
+                last_sec = sec
+            elif sec != last_sec:
+                recent_sec_counts.append(counts_per_sec.get(last_sec, 0))
+                last_sec = sec
+
+            if ema_count is None:
+                ema_count = float(count)
+            else:
+                ema_count = ema_alpha * float(count) + (1.0 - ema_alpha) * float(ema_count)
 
             label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP | Panic: {panic:.2f}"
             # If location config includes true area, show people per m^2
@@ -426,6 +457,37 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 area_m2 = float(cfg["area_m2"])
                 dens_m2 = (count / area_m2) if area_m2 > 0 else 0.0
                 label += f" | {dens_m2:.2f}/m^2"
+
+            pred_enabled = bool(int(CONFIG.get("predict_alert_enabled", 1)))
+            horizon = int(CONFIG.get("predict_horizon_sec", 10) or 10)
+            if pred_enabled and area_mp and len(recent_sec_counts) >= 3:
+                n = len(recent_sec_counts)
+                s_t = (n - 1) * n / 2.0
+                s_tt = (n - 1) * n * (2 * n - 1) / 6.0
+                s_y = sum(float(v) for v in recent_sec_counts)
+                s_ty = sum(float(v) * i for i, v in enumerate(recent_sec_counts))
+                denom = n * s_tt - s_t * s_t
+                if denom != 0:
+                    a = (n * s_ty - s_t * s_y) / denom
+                    b = (s_y / n) - a * (s_t / n)
+                    max_pred_dens = 0.0
+                    breach = False
+                    for k in range(1, horizon + 1):
+                        idx_f = (n - 1) + k
+                        y_hat = a * idx_f + b
+                        d_hat = (y_hat / area_mp) if area_mp else 0.0
+                        if d_hat > max_pred_dens:
+                            max_pred_dens = d_hat
+                        if d_hat > density_thr:
+                            breach = True
+                    if breach:
+                        now_ts = int(time.time())
+                        cooldown = int(CONFIG.get("alert_cooldown_sec", 15) or 15)
+                        last_ts = LAST_ALERT_TS.get(filename, 0)
+                        if now_ts - last_ts >= cooldown:
+                            sev_label = _severity_for_density(max_pred_dens)
+                            _record_alert(source_label, int(max(0.0, y_hat)), float(max_pred_dens), float(panic), sev_label)
+                            LAST_ALERT_TS[filename] = now_ts
 
             cv2.putText(frame, label, (10, int(banner_h * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             # Optional timestamp/second estimate
@@ -463,6 +525,8 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 "density_mp": round(float(dens), 3),
                 "severity": _severity_for_count(count)["label"],
             }
+            if pred_enabled and area_mp and len(recent_sec_counts) >= 3:
+                payload["pred_density_mp"] = round(float(max_pred_dens), 3) if 'max_pred_dens' in locals() else 0.0
             if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
                 payload["density_m2"] = round((count / float(cfg["area_m2"])) if float(cfg["area_m2"]) > 0 else 0.0, 3)
             if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
@@ -817,7 +881,9 @@ async def alerts_get_config():
     return JSONResponse({"config": CONFIG})
 
 @app.post("/alerts/config")
-async def alerts_set_config(density_threshold: float = None, panic_threshold: float = None, panic_window: int = None, panic_scale: float = None):
+async def alerts_set_config(density_threshold: float = None, panic_threshold: float = None, panic_window: int = None, panic_scale: float = None,
+                            predict_window_sec: float = None, predict_horizon_sec: float = None, predict_alert_enabled: int = None,
+                            alert_cooldown_sec: int = None, ema_alpha: float = None, z_threshold: float = None):
     if density_threshold is not None:
         CONFIG["density_threshold"] = float(density_threshold)
     if panic_threshold is not None:
@@ -826,6 +892,18 @@ async def alerts_set_config(density_threshold: float = None, panic_threshold: fl
         CONFIG["panic_window"] = int(panic_window)
     if panic_scale is not None and float(panic_scale) > 0:
         CONFIG["panic_scale"] = float(panic_scale)
+    if predict_window_sec is not None and float(predict_window_sec) > 1:
+        CONFIG["predict_window_sec"] = float(predict_window_sec)
+    if predict_horizon_sec is not None and float(predict_horizon_sec) >= 1:
+        CONFIG["predict_horizon_sec"] = float(predict_horizon_sec)
+    if predict_alert_enabled is not None:
+        CONFIG["predict_alert_enabled"] = 1.0 if int(predict_alert_enabled) else 0.0
+    if alert_cooldown_sec is not None and int(alert_cooldown_sec) >= 0:
+        CONFIG["alert_cooldown_sec"] = int(alert_cooldown_sec)
+    if ema_alpha is not None and 0 < float(ema_alpha) < 1:
+        CONFIG["ema_alpha"] = float(ema_alpha)
+    if z_threshold is not None and float(z_threshold) > 0:
+        CONFIG["z_threshold"] = float(z_threshold)
     return JSONResponse({"config": CONFIG})
 
 @app.get("/locations")

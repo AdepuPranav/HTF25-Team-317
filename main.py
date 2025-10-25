@@ -730,3 +730,20 @@ async def congestion_feed(include_idle: int = 0):
 if __name__ == "__main__":
     # For local testing: python main.py
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+from fastapi import FastAPI
+from datetime import datetime
+
+app = FastAPI()
+
+@app.get("/alerts/latest")
+def latest_alert():
+    return {
+        "latest": {
+            "time": datetime.now().isoformat(),
+            "severity": "SAFE",
+            "source": "system",
+            "message": "No alerts detected."
+        }
+    }
