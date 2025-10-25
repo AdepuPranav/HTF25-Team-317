@@ -13,6 +13,18 @@ try:
 except Exception:
     YOLO = None
 
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+@app.get("/dashboard")
+def dashboard():
+    return "<h1>Dashboard works 🎯</h1>"
+
+
 app = FastAPI(title="Crowd Data Ingestion - Video Uploader")
 
 # In-memory location configs keyed by filename.
@@ -933,6 +945,100 @@ async def congestion_feed(include_idle: int = 0):
                 items.append(payload)
     return JSONResponse({"items": items})
 
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    html_content = """
+    <html>
+        <head>
+            <title>Crowd Safety Dashboard</title>
+        </head>
+        <body style="font-family: sans-serif; background: #f5f5f5;">
+            <h1>🎥 Crowd Safety Intelligence Dashboard</h1>
+            <p>✅ Live video overlay stream: <a href="/videos/stream" target="_blank">View Stream</a></p>
+            <p>⚙️ Analyze demo videos: <a href="/videos/analyze/demo" target="_blank">Run Analysis</a></p>
+            <p>📊 Latest Alerts: <a href="/alerts/latest" target="_blank">Check Alerts</a></p>
+            <p>🌍 Congestion Map Data: <a href="/congestion" target="_blank">View Congestion Data</a></p>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 if __name__ == "__main__":
     # For local testing: python main.py
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+from fastapi import FastAPI
+from datetime import datetime
+
+app = FastAPI()
+
+@app.get("/alerts/latest")
+def latest_alert():
+    return {
+        "latest": {
+            "time": datetime.now().isoformat(),
+            "severity": "SAFE",
+            "source": "system",
+            "message": "No alerts detected."
+        }
+    }
+
+
+from fastapi import FastAPI, Request
+from typing import Optional
+
+app = FastAPI()
+
+config = {
+    "density_threshold": 10,
+    "panic_threshold": 0.5,
+    "panic_window": 10,
+    "panic_scale": 5,
+    "predict_alert_enabled": 0,
+    "predict_horizon_sec": 10,
+    "predict_window_sec": 30,
+    "alert_cooldown_sec": 10,
+}
+
+@app.post("/alerts/config")
+async def set_config(
+    density_threshold: Optional[float] = None,
+    panic_threshold: Optional[float] = None,
+    panic_window: Optional[int] = None,
+    panic_scale: Optional[float] = None,
+    predict_alert_enabled: Optional[int] = None,
+    predict_horizon_sec: Optional[int] = None,
+    predict_window_sec: Optional[int] = None,
+    alert_cooldown_sec: Optional[int] = None,
+):
+    # Update configuration dynamically
+    for k, v in locals().items():
+        if v is not None and k != "app":
+            config[k] = v
+    return {"status": "ok", "config": config}
+
+@app.get("/alerts/config")
+async def get_config():
+    return {"config": config}
+
+
+
+from datetime import datetime
+
+@app.get("/alerts/latest")
+def latest_alert():
+    return {
+        "latest": {
+            "time": datetime.now().isoformat(),
+            "severity": "SAFE",
+            "source": "system",
+            "message": "No crowd anomalies detected."
+        }
+    }
+
+
