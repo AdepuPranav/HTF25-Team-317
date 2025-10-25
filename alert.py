@@ -330,6 +330,22 @@ def _severity_for_density(density_per_mp: float) -> str:
         return "MODERATE"
     return "CRITICAL"
 
+def _point_in_polygon(x: int, y: int, poly: List[List[int]]) -> bool:
+    # Ray casting algorithm for point-in-polygon
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        # Check if point is between y1 and y2, then compute x-intersect
+        if ((y1 > y) != (y2 > y)):
+            xinters = (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1
+            if x < xinters:
+                inside = not inside
+    return inside
+
 def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog', source_label: str = "stream"):
 
     cap = cv2.VideoCapture(path)
