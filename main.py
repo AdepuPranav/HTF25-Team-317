@@ -679,8 +679,11 @@ async def dashboard():
         <button id="useLoc">Select Current Location</button>
         <input id="uloc" type="text" placeholder="Enter location (e.g., Secunderabad Station)" style="width:280px;" />
         <button id="geocode">Locate</button>
-        <button id="pickOnMap">Pick on Map</button>
         <button id="recenter">Recenter</button>
+        <button id="avoidBtn" style="display:none;background:#c62828;color:#fff;">Avoid Crowds</button>
+        <br/>
+        <input id="dest" type="text" placeholder="Enter destination" style="width:280px;margin-top:6px;" />
+        <button id="routeBtn">Route to Destination</button>
       </div>
       <div class="grid">
         <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
@@ -765,8 +768,9 @@ async def dashboard():
             const by = j && j.by_source ? j.by_source : {};
             const entries = Object.values(by);
             if(!entries.length) return;
-            if(!userMarker) return; // No user location -> suppress alerts
-            const u = userMarker.getLatLng();
+            if(!userMarker && !destMarker) return; // No centers -> suppress alerts
+            const u = userMarker ? userMarker.getLatLng() : null;
+            const d = destMarker ? destMarker.getLatLng() : null;
             const now = Date.now();
             for(const a of entries){
               if(!a || (a.severity||'').toUpperCase() !== 'CRITICAL') continue;
@@ -774,8 +778,11 @@ async def dashboard():
               // Require a visible marker in range
               if(!markers.has(src)) continue;
               const m = markers.get(src).marker;
-              const dist = map.distance(m.getLatLng(), u);
-              if(dist > USER_RADIUS_METERS) continue;
+              const mll = m.getLatLng();
+              let near = false;
+              if(u){ near = near || (map.distance(mll, u) <= USER_RADIUS_METERS); }
+              if(d){ near = near || (map.distance(mll, d) <= USER_RADIUS_METERS); }
+              if(!near) continue;
               const lastAt = perSourcePopupAt[src] || 0;
               if(now - lastAt < 30000) continue; // 30s cooldown per source
               const box = document.getElementById('alertBox');
@@ -807,8 +814,10 @@ async def dashboard():
         let locationsCache = {};
         let userMarker = null;
         let userCircle = null;
-        let pickMode = false;
         const USER_RADIUS_METERS = 3000; // 3 km radius gate for visibility
+        const AVOID_DISTANCE_METERS = 1000; // target distance to move away from crowds
+        let destMarker = null; // single destination marker (used for both routing and avoid)
+        let destCircle = null; // invisible radius around destination
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -827,21 +836,29 @@ async def dashboard():
             const r = await fetch('/congestion?include_idle=0');
             const j = await r.json();
             if(!j.items) return;
-            // If user location is not set, hide all markers.
-            if(!userMarker){
+            // If neither user nor destination is set, hide all markers.
+            if(!userMarker && !destMarker){
               if(markers.size){
                 markers.forEach(({ marker }) => { map.removeLayer(marker); });
                 markers.clear();
               }
+              // hide avoid button when no user location
+              const ab = document.getElementById('avoidBtn');
+              if(ab) ab.style.display = 'none';
               setTimeout(poll, 3000);
               return;
             }
-            const u = userMarker.getLatLng();
+            const u = userMarker ? userMarker.getLatLng() : null;
+            const d = (typeof destMarker !== 'undefined' && destMarker) ? destMarker.getLatLng() : null;
+            const criticalInRange = [];
+            const criticalInRangeDest = [];
             j.items.forEach(it => {
               if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
               const key = it.filename;
-              const dist = map.distance(L.latLng(it.lat, it.lon), u);
-              const inRange = dist <= USER_RADIUS_METERS;
+              const mll = L.latLng(it.lat, it.lon);
+              const distU = u ? map.distance(mll, u) : Infinity;
+              const distD = d ? map.distance(mll, d) : Infinity;
+              const inRange = (distU <= USER_RADIUS_METERS) || (distD <= USER_RADIUS_METERS);
               if(!inRange){
                 if(markers.has(key)){
                   const { marker } = markers.get(key);
@@ -850,8 +867,12 @@ async def dashboard():
                 }
                 return;
               }
+              if((it.severity||'').toUpperCase() === 'CRITICAL'){
+                if(u && distU <= USER_RADIUS_METERS){ criticalInRange.push([it.lat, it.lon]); }
+                if(d && distD <= USER_RADIUS_METERS){ criticalInRangeDest.push([it.lat, it.lon]); }
+              }
               const html = `<b>${it.location_id || key}</b><br/>`+
-                `<span class="${sevClass(it.severity)}">${it.severity}</span><br/>`+
+                `<span class=\"${sevClass(it.severity)}\">${it.severity}</span><br/>`+
                 `Count: ${it.count}<br/>`+
                 `Density: ${(it.density_mp??0).toFixed(2)}/MP` + (it.density_m2? `<br/>${it.density_m2.toFixed(2)}/m²` : '');
               const radius = Math.min(30, 6 + (it.count||0));
@@ -868,10 +889,7 @@ async def dashboard():
                   if(userMarker){
                     const u = userMarker.getLatLng();
                     if(router){ map.removeControl(router); router=null; }
-                    router = L.Routing.control({
-                      waypoints: [ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ],
-                      routeWhileDragging: false,
-                    }).addTo(map);
+                    createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ]);
                     return;
                   }
                   // Fallback to original 2-click routing between markers
@@ -887,21 +905,226 @@ async def dashboard():
                 markers.set(key, { marker });
               }
             });
+            // Toggle Avoid button visibility
+            const ab = document.getElementById('avoidBtn');
+            if(ab){ ab.style.display = (criticalInRange.length > 0 || criticalInRangeDest.length > 0) ? 'inline-block' : 'none'; }
           }catch(e){/* ignore */}
           setTimeout(poll, 3000);
         }
         poll();
+
+        function toRad(d){ return d * Math.PI / 180; }
+        function toDeg(r){ return r * 180 / Math.PI; }
+        function destPoint(lat, lon, bearingDeg, distanceMeters){
+          const R = 6371000; // Earth radius m
+          const br = toRad(bearingDeg);
+          const φ1 = toRad(lat);
+          const λ1 = toRad(lon);
+          const δ = distanceMeters / R;
+          const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
+          const sinδ = Math.sin(δ), cosδ = Math.cos(δ);
+          const sinφ2 = sinφ1 * cosδ + cosφ1 * sinδ * Math.cos(br);
+          const φ2 = Math.asin(sinφ2);
+          const y = Math.sin(br) * sinδ * cosφ1;
+          const x = cosδ - sinφ1 * sinφ2;
+          const λ2 = λ1 + Math.atan2(y, x);
+          return { lat: toDeg(φ2), lon: toDeg(λ2) };
+        }
+
+        // Collect CRITICAL markers near either center
+        function collectCriticalNearAny(u, d){
+          const crit = [];
+          markers.forEach(({ marker }) => {
+            const mll = marker.getLatLng();
+            let near = false;
+            if(u){ near = near || (map.distance(mll, u) <= USER_RADIUS_METERS); }
+            if(d){ near = near || (map.distance(mll, d) <= USER_RADIUS_METERS); }
+            if(!near) return;
+            const content = marker.getPopup() && marker.getPopup().getContent();
+            if(typeof content === 'string' && content.includes('CRITICAL')){
+              crit.push([mll.lat, mll.lng]);
+            }
+          });
+          return crit;
+        }
+
+        // Check if any critical marker lies too close to the route polyline
+        function isRouteUnsafe(routeCoords, crit, thresholdMeters = 200){
+          if(!crit.length || !routeCoords || !routeCoords.length) return false;
+          // Coarse check: for each critical point, find a close route vertex
+          for(const c of crit){
+            const cll = L.latLng(c[0], c[1]);
+            for(const rc of routeCoords){
+              const rll = L.latLng(rc.lat, rc.lng);
+              if(map.distance(cll, rll) <= thresholdMeters){ return true; }
+            }
+          }
+          return false;
+        }
+
+        // Compute a detour waypoint perpendicular away from critical centroid near the user
+        function computeDetourWaypoint(u, dest, crit){
+          if(!crit.length) return null;
+          const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+          const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+          // Vector from user to centroid
+          const vx = cx - u.lat;
+          const vy = cy - u.lng;
+          // Perpendicular vector (vy, -vx)
+          let px = vy, py = -vx;
+          const norm = Math.hypot(px, py) || 1;
+          px /= norm; py /= norm;
+          const perpBearing = toDeg(Math.atan2(py, px));
+          const detour = destPoint(u.lat, u.lng, perpBearing, AVOID_DISTANCE_METERS);
+          return L.latLng(detour.lat, detour.lon);
+        }
+
+        let rerouteGuard = false;
+        function createRouterWithSafety(waypoints){
+          if(router){ map.removeControl(router); router=null; }
+          router = L.Routing.control({
+            waypoints,
+            routeWhileDragging: false,
+            addWaypoints: false,
+            draggableWaypoints: false,
+            createMarker: () => null,
+          }).addTo(map);
+          router.on('routesfound', (e) => {
+            try{
+              const route = e.routes && e.routes[0];
+              if(!route) return;
+              const coords = (route.coordinates||[]).map(p => ({ lat: p.lat, lng: p.lng }));
+              const u = waypoints[0];
+              const d = waypoints[waypoints.length-1];
+              const crit = collectCriticalNearAny(u, d);
+              if(isRouteUnsafe(coords, crit) && !rerouteGuard){
+                rerouteGuard = true;
+                const detour = computeDetourWaypoint(u, d, crit);
+                if(detour){ createRouterWithSafety([ L.latLng(u.lat, u.lng), detour, L.latLng(d.lat, d.lng) ]); }
+                setTimeout(() => { rerouteGuard = false; }, 1000);
+              }
+            }catch(_){ /* ignore */ }
+          });
+        }
+
+        async function geocodeOnce(q){
+          const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=1`;
+          const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+          if(!resp.ok) throw new Error('geocode failed');
+          const arr = await resp.json();
+          if(!arr || !arr.length) throw new Error('no results');
+          return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon), name: arr[0].display_name };
+        }
+
+        function collectCriticalInRange(u){
+          const crit = [];
+          markers.forEach(({ marker }) => {
+            const mll = marker.getLatLng();
+            const dist = map.distance(mll, u);
+            if(dist <= USER_RADIUS_METERS){
+              const content = marker.getPopup() && marker.getPopup().getContent();
+              if(typeof content === 'string' && content.includes('CRITICAL')){
+                crit.push([mll.lat, mll.lng]);
+              }
+            }
+          });
+          return crit;
+        }
+
+        document.getElementById('routeBtn').onclick = async () => {
+          if(!userMarker){ alert('Set your current location first'); return; }
+          const q = (document.getElementById('dest').value || '').trim();
+          if(!q){ alert('Enter a destination'); return; }
+          try{
+            const dest = await geocodeOnce(q);
+            const u = userMarker.getLatLng();
+            const crit = collectCriticalInRange(u);
+            const waypoints = [];
+            waypoints.push(L.latLng(u.lat, u.lng));
+            if(crit.length){
+              // Compute a perpendicular detour 1km away from the crowd centroid near the user
+              const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+              const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+              // Vector from user to centroid
+              const vx = cx - u.lat;
+              const vy = cy - u.lng;
+              // Perpendicular vector (vy, -vx)
+              let px = vy, py = -vx;
+              const norm = Math.hypot(px, py) || 1;
+              px /= norm; py /= norm;
+              // Move ~1km along perpendicular from user
+              const perpBearing = toDeg(Math.atan2(py, px));
+              const detour = destPoint(u.lat, u.lng, perpBearing, AVOID_DISTANCE_METERS);
+              waypoints.push(L.latLng(detour.lat, detour.lon));
+            }
+            waypoints.push(L.latLng(dest.lat, dest.lon));
+            createRouterWithSafety(waypoints);
+            // Place/refresh destination marker explicitly
+            if(destMarker){ destMarker.setLatLng([dest.lat, dest.lon]); }
+            else { destMarker = L.marker([dest.lat, dest.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); }
+            // Place/refresh destination radius (dotted outline, no fill)
+            if(destCircle){ destCircle.setLatLng([dest.lat, dest.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+            else { destCircle = L.circle([dest.lat, dest.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+          }catch(e){ alert('Failed to route to destination: ' + e.message); }
+        };
+
+        document.getElementById('avoidBtn').onclick = () => {
+          if(!userMarker) return;
+          // Collect positions of current in-range CRITICAL markers
+          const u = userMarker.getLatLng();
+          const crit = [];
+          markers.forEach(({ marker }, key) => {
+            const mll = marker.getLatLng();
+            const dist = map.distance(mll, u);
+            if(dist <= USER_RADIUS_METERS){
+              // We don't store severity on marker; approximate by color class via radius/color
+              // Instead, rely on popup HTML containing severity text
+              const content = marker.getPopup() && marker.getPopup().getContent();
+              if(typeof content === 'string' && content.includes('CRITICAL')){
+                crit.push([mll.lat, mll.lng]);
+              }
+            }
+          });
+          if(!crit.length) return;
+          // Compute centroid of critical markers
+          const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+          const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+          // Bearing from user to centroid
+          const dy = toRad(cx - u.lat);
+          const dx = toRad(cy - u.lng) * Math.cos(toRad((u.lat+cx)/2));
+          const bearingToCrowd = Math.atan2(dx, dy);
+          const bearingAwayDeg = (toDeg(bearingToCrowd) + 180) % 360;
+          const dest = destPoint(u.lat, u.lng, bearingAwayDeg, AVOID_DISTANCE_METERS);
+          // Place/refresh single destination marker
+          if(destMarker){ destMarker.setLatLng([dest.lat, dest.lon]); }
+          else { destMarker = L.marker([dest.lat, dest.lon], { title: 'Suggested safer route' }).addTo(map).bindPopup('Suggested safer route'); }
+          // Place/refresh destination radius (dotted outline, no fill)
+          if(destCircle){ destCircle.setLatLng([dest.lat, dest.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+          else { destCircle = L.circle([dest.lat, dest.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+          destMarker.openPopup();
+          // Draw route
+          createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(dest.lat, dest.lon) ]);
+        };
 
         function placeUser(lat, lon, accuracy){
           const latlng = L.latLng(lat, lon);
           if(userMarker){ userMarker.setLatLng(latlng); }
           else {
             userMarker = L.marker(latlng, { title: 'You are here', draggable: true }).addTo(map).bindPopup('You are here');
-            userMarker.on('dragend', () => {
+            // Prevent map click handler from firing due to marker interactions
+            userMarker.on('dragstart', (e) => { if(typeof L !== 'undefined' && L.DomEvent){ L.DomEvent.stopPropagation(e); } });
+            userMarker.on('click', (e) => { if(typeof L !== 'undefined' && L.DomEvent){ L.DomEvent.stopPropagation(e); } });
+            userMarker.on('dragend', (e) => {
+              if(typeof L !== 'undefined' && L.DomEvent){ L.DomEvent.stopPropagation(e); }
               const ll = userMarker.getLatLng();
               if(userCircle){ userCircle.setLatLng(ll); }
               const tf = document.getElementById('uloc');
               if(tf) tf.value = `${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}`;
+              // If a route exists, update its origin to the new user position
+              if(router && typeof router.getWaypoints === 'function' && typeof router.setWaypoints === 'function'){
+                const wps = router.getWaypoints().map(w => w.latLng);
+                if(wps.length){ wps[0] = L.latLng(ll.lat, ll.lng); router.setWaypoints(wps); }
+              }
             });
           }
           if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
@@ -911,6 +1134,11 @@ async def dashboard():
           // Sync text field
           const tf = document.getElementById('uloc');
           if(tf) tf.value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+          // If a route exists, update its origin to the new user position
+          if(router && typeof router.getWaypoints === 'function' && typeof router.setWaypoints === 'function'){
+            const wps = router.getWaypoints().map(w => w.latLng);
+            if(wps.length){ wps[0] = L.latLng(lat, lon); router.setWaypoints(wps); }
+          }
         }
 
         document.getElementById('useLoc').onclick = async () => {
@@ -944,18 +1172,6 @@ async def dashboard():
           }catch(e){ alert('Geocoding error'); }
         }
         document.getElementById('geocode').onclick = geocodeAndPlace;
-
-        document.getElementById('pickOnMap').onclick = () => {
-          pickMode = !pickMode;
-          document.getElementById('pickOnMap').textContent = pickMode ? 'Picking… (click on map)' : 'Pick on Map';
-        };
-
-        map.on('click', (e) => {
-          if(!pickMode) return;
-          pickMode = false;
-          document.getElementById('pickOnMap').textContent = 'Pick on Map';
-          placeUser(e.latlng.lat, e.latlng.lng, null);
-        });
 
         document.getElementById('recenter').onclick = () => {
           if(userMarker){
