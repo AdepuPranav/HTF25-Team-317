@@ -861,6 +861,39 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
             area_m2 = float(cfg["area_m2"])
             item["density_per_m2"] = round((cnt / area_m2), 3) if area_m2 > 0 else 0.0
         series.append(item)
+    # Forecast next H seconds using linear regression over last N seconds
+    forecast = []
+    if series:
+        cfg = LOCATION_CONFIGS.get(filename)
+        area_m2 = float(cfg["area_m2"]) if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2") else None
+        horizon = int(CONFIG.get("predict_horizon_sec", 10) or 10)
+        window = int(CONFIG.get("predict_window_sec", 30) or 30)
+        # Build last N counts in time order
+        series_sorted = sorted(series, key=lambda x: x["second"])  # ensure ascending seconds
+        y_vals = [float(p["count"]) for p in series_sorted][-window:]
+        n = len(y_vals)
+        if n >= 3:
+            s_t = (n - 1) * n / 2.0
+            s_tt = (n - 1) * n * (2 * n - 1) / 6.0
+            s_y = sum(y_vals)
+            s_ty = sum(y_vals[i] * i for i in range(n))
+            denom = n * s_tt - s_t * s_t
+            if denom != 0:
+                a = (n * s_ty - s_t * s_y) / denom
+                b = (s_y / n) - a * (s_t / n)
+                last_sec = series_sorted[-1]["second"]
+                for k in range(1, horizon + 1):
+                    idx_f = (n - 1) + k
+                    y_hat = max(0.0, a * idx_f + b)
+                    dens_mp_hat = (y_hat / area_mp) if area_mp else 0.0
+                    item = {
+                        "second": int(last_sec + k),
+                        "count_hat": round(y_hat, 3),
+                        "density_per_mp_hat": round(dens_mp_hat, 3)
+                    }
+                    if area_m2 and area_m2 > 0:
+                        item["density_per_m2_hat"] = round((y_hat / area_m2), 3)
+                    forecast.append(item)
     # Basic alert check on aggregate (max density over seconds)
     if series:
         max_dens = max(p["density_per_mp"] for p in series)
@@ -869,7 +902,7 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
         if (max_dens > CONFIG.get("density_threshold", 12.0)) or (panic > CONFIG.get("panic_threshold", 0.7)):
             sev = _severity_for_density(max_dens)
             _record_alert(filename, int(avg_cnt), float(max_dens), float(panic), sev)
-    return JSONResponse({"filename": filename, "frame_stride": frame_stride, "series": series, "area_mp": round(area_mp, 3) if area_mp else 0.0})
+    return JSONResponse({"filename": filename, "frame_stride": frame_stride, "series": series, "forecast": forecast, "area_mp": round(area_mp, 3) if area_mp else 0.0})
 
 # --- Alerts API ---
 @app.get("/alerts/latest")
