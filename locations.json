@@ -117,5 +117,19 @@
     "roi": [],
     "lat": 17.385,
     "lon": 78.4867
+  },
+  "3.mp4": {
+    "location_id": "Secunderabad Railway Station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "4.mp4": {
+    "location_id": "Uppal, Telangana",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4056,
+    "lon": 78.5596
   }
 }
