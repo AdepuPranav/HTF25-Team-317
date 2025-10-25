@@ -10,6 +10,7 @@ import json
 from typing import Dict, List, Optional
 from collections import deque
 from datetime import datetime
+import hashlib
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception:
@@ -221,30 +222,6 @@ def _list_demo_videos() -> List[Dict[str, object]]:
                     items.append({"filename": name, "path": p, "size_bytes": size})
     return items
 
-def _hog_detector():
-    hog = cv2.HOGDescriptor()
-    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    return hog
-
-def _hog_detect(frame, hog, hit_threshold: float = 0.0, win_stride=(6, 6), padding=(8, 8), scale: float = 1.05, nms_thresh: float = 0.3):
-    rects, weights = hog.detectMultiScale(frame, hitThreshold=hit_threshold, winStride=win_stride, padding=padding, scale=scale)
-    if rects is None or len(rects) == 0:
-        return []
-    bboxes = []
-    confs = []
-    for (x, y, w, h), wgt in zip(rects, weights if weights is not None else [0.0] * len(rects)):
-        bboxes.append([int(x), int(y), int(w), int(h)])
-        confs.append(float(wgt))
-    idxs = cv2.dnn.NMSBoxes(bboxes, confs, score_threshold=0.0, nms_threshold=nms_thresh)
-    if idxs is None or len(idxs) == 0:
-        return []
-    sel = []
-    for i in idxs:
-        j = int(i[0]) if hasattr(i, '__len__') else int(i)
-        x, y, w, h = bboxes[j]
-        sel.append((x, y, w, h))
-    return sel
-
 _YOLO_MODEL = None
 
 def _get_yolo():
@@ -296,17 +273,22 @@ def _nms_boxes(boxes: List[tuple], iou_thresh: float = 0.5) -> List[tuple]:
         order = remain
     return [boxes[i] for i in keep]
 
-def _detect_people(frame, detector: str = 'hog') -> List[tuple]:
+def _stable_index(key: str, n: int) -> int:
+    if not key or n <= 0:
+        return 0
+    d = hashlib.md5(key.encode('utf-8')).digest()
+    # take 8 bytes for a positive integer
+    val = int.from_bytes(d[:8], byteorder='big', signed=False)
+    return val % n
+
+def _detect_people(frame) -> List[tuple]:
     h, w = frame.shape[:2]
     boxes: List[tuple] = []
-    if detector == 'yolo':
-        try:
-            boxes += _yolo_detect(frame, conf=0.25, iou=0.5, imgsz=960)
-        except Exception:
-            pass
-    else:
-        hog = _hog_detector()
-        boxes += _hog_detect(frame, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+    try:
+        boxes += _yolo_detect(frame, conf=0.25, iou=0.5, imgsz=960)
+    except Exception:
+        pass
+
     # Tiled 2x2 pass to capture smaller/occluded persons in crowded scenes
     tiles = [
         (0, 0, w // 2, h // 2),
@@ -318,19 +300,25 @@ def _detect_people(frame, detector: str = 'hog') -> List[tuple]:
         if tw < 160 or th < 160:
             continue
         crop = frame[ty:ty + th, tx:tx + tw]
-        if detector == 'yolo':
-            try:
-                b2 = _yolo_detect(crop, conf=0.22, iou=0.5, imgsz=960)
-            except Exception:
-                b2 = []
-        else:
-            hog = _hog_detector()
-            b2 = _hog_detect(crop, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+        try:
+            b2 = _yolo_detect(crop, conf=0.22, iou=0.5, imgsz=960)
+        except Exception:
+            b2 = []
         for (x, y, rw, rh) in b2:
             boxes.append((x + tx, y + ty, rw, rh))
     return _nms_boxes(boxes, iou_thresh=0.45)
 
-def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 960, detector: str = 'hog') -> Dict[str, object]:
+_YOLO_MODEL = None
+
+def _get_yolo():
+    global _YOLO_MODEL
+    if _YOLO_MODEL is None:
+        if YOLO is None:
+            raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
+        _YOLO_MODEL = YOLO('yolov8n.pt')
+    return _YOLO_MODEL
+
+def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 960) -> Dict[str, object]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail=f"Failed to open video: {os.path.basename(path)}")
@@ -338,7 +326,6 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    hog = _hog_detector()
     processed = 0
     detections_total = 0
     max_in_frame = 0
@@ -359,10 +346,8 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
                 ratio = resize_width / float(frame.shape[1])
                 new_h = int(frame.shape[0] * ratio)
                 frame = cv2.resize(frame, (resize_width, new_h))
-            if detector == 'yolo':
-                rects = _yolo_detect(frame, conf=0.3, iou=0.5, imgsz=640)
-            else:
-                rects = _hog_detect(frame, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+            rects = _detect_people(frame)
+
             count = len(rects)
             timeline.append(count)
             detections_total += count
@@ -417,28 +402,26 @@ async def list_demo_videos():
         items = _list_demo_videos()
     if not items:
         return JSONResponse({"videos": [], "message": "No videos found in blob storage or local directory."})
-    # Auto-geotag first two non-empty videos if not present
+    # Hardcode geotags for first 4 videos (static, non-randomized)
     try:
-        if len(items) >= 1:
-            f0 = items[0]["filename"]
-            cfg0 = LOCATION_CONFIGS.get(f0, {})
-            if "location_id" not in cfg0: cfg0["location_id"] = "Secunderabad Railway Station"
-            if "area_m2" not in cfg0: cfg0["area_m2"] = 1000.0
-            if "roi" not in cfg0: cfg0["roi"] = []
-            if "lat" not in cfg0: cfg0["lat"] = 17.4399
-            if "lon" not in cfg0: cfg0["lon"] = 78.4983
-            LOCATION_CONFIGS[f0] = cfg0
-            _save_locations()
-        if len(items) >= 2:
-            f1 = items[1]["filename"]
-            cfg1 = LOCATION_CONFIGS.get(f1, {})
-            if "location_id" not in cfg1: cfg1["location_id"] = "Uppal, Telangana"
-            if "area_m2" not in cfg1: cfg1["area_m2"] = 1000.0
-            if "roi" not in cfg1: cfg1["roi"] = []
-            if "lat" not in cfg1: cfg1["lat"] = 17.4056
-            if "lon" not in cfg1: cfg1["lon"] = 78.5596
-            LOCATION_CONFIGS[f1] = cfg1
-            _save_locations()
+        presets = [
+            ("Secunderabad Railway Station", 17.4399, 78.4983),
+            ("Uppal", 17.4056, 78.5596),
+            ("Marredpally", 17.4479, 78.5029),
+            ("Nagole", 17.3693, 78.5609),
+        ]
+        for i, (lid, lat, lon) in enumerate(presets):
+            if i >= len(items):
+                break
+            fname = items[i]["filename"]
+            cfg = LOCATION_CONFIGS.get(fname, {})
+            if "location_id" not in cfg: cfg["location_id"] = lid
+            if "area_m2" not in cfg: cfg["area_m2"] = 1000.0
+            if "roi" not in cfg: cfg["roi"] = []
+            if "lat" not in cfg: cfg["lat"] = float(lat)
+            if "lon" not in cfg: cfg["lon"] = float(lon)
+            LOCATION_CONFIGS[fname] = cfg
+        _save_locations()
     except Exception:
         pass
     return JSONResponse({"videos": items})
@@ -484,7 +467,7 @@ async def list_all_sources():
                         pick = s
                         break
                 if pick is None:
-                    pick = spots[i % len(spots)]
+                    pick = spots[_stable_index(fname, len(spots))]
                 lat, lon, lid = pick
                 LOCATION_CONFIGS[fname] = {
                     "location_id": lid,
@@ -619,12 +602,11 @@ def _update_severity_with_hysteresis(source: str, dens_value: float, per_m2: boo
     color = (0, 200, 0) if label == "SAFE" else ((0, 215, 255) if label == "MODERATE" else (0, 0, 255))
     return {"label": label, "color": color, "ema": ema}
 
-def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog'):
+def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         yield b""
         return
-    hog = _hog_detector() if detector != 'yolo' else None
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     idx = 0
     filename = os.path.basename(path)
@@ -639,7 +621,7 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             (17.4933, 78.3996, "KPHB"),
             (17.3566, 78.5570, "LB Nagar"),
         ]
-        idx = abs(hash(filename)) % len(spots)
+        idx = _stable_index(filename, len(spots))
         lat, lon, lid = spots[idx]
         cfg = {
             "location_id": lid,
@@ -669,7 +651,8 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 ratio = resize_width / float(frame.shape[1])
                 new_h = int(frame.shape[0] * ratio)
                 frame = cv2.resize(frame, (resize_width, new_h))
-            rects = _detect_people(frame, detector=detector)
+            rects = _detect_people(frame)
+
             count = 0
             if rects:
                 # If ROI is defined, filter boxes whose center lies inside ROI
@@ -840,7 +823,7 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
         cap.release()
 
 @app.get("/videos/stream")
-async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str = 'hog'):
+async def stream_demo_video(filename: str, frame_stride: int = 2):
     items = _list_demo_videos()
     # Also check blob videos if enabled
     if blob_enabled():
@@ -851,15 +834,13 @@ async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str 
     if not any(it["filename"] == filename for it in items):
         raise HTTPException(status_code=404, detail="Requested filename not found or empty")
     path = next(it["path"] for it in items if it["filename"] == filename)
-    if detector not in {"hog", "yolo"}:
-        raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
-    if detector == 'yolo' and YOLO is None:
+    if YOLO is None:
         raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
     # Resolve blob:// paths to temp files; cleanup after streaming
     proc_path, cleanup = resolve_path_for_processing(path) if resolve_path_for_processing else (path, lambda: None)
     def _gen():
         try:
-            gen = _stream_overlay(proc_path, frame_stride=frame_stride, detector=detector)
+            gen = _stream_overlay(proc_path, frame_stride=frame_stride)
             for chunk in gen:
                 yield chunk
         finally:
@@ -902,7 +883,6 @@ async def dashboard():
       <div id="alertBox" style="display:none;padding:12px 14px;border-radius:8px;color:#fff;position:fixed;top:16px;right:16px;z-index:1000;box-shadow:0 6px 16px rgba(0,0,0,0.2);"></div>
       <div id="list">Loading...</div>
       <div id="controls">
-        <label>Detector: <select id="det"><option value="hog" selected>HOG</option><option value="yolo">YOLOv8</option></select></label>
         <label>Frame stride: <input id="stride" type="number" value="2" min="1" max="10" /></label>
         <button id="start">Start Selected (max 3)</button>
         <button id="stop">Stop All</button>
@@ -916,6 +896,11 @@ async def dashboard():
         <label style="margin-left:8px;">Rate <input id="voiceRate" type="range" min="0.5" max="1.5" step="0.1" value="1.0" /></label>
         <label style="margin-left:8px;">Step-by-step <input id="voiceStep" type="checkbox" checked /></label>
         <button id="voiceRepeat" type="button">Repeat</button>
+        <button id="voiceStop" type="button">Stop Voice</button>
+        <button id="avoidBtn" style="display:none;background:#c62828;color:#fff;">Avoid Crowds</button>
+        <br/>
+        <input id="dest" type="text" placeholder="Enter destination" style="width:280px;margin-top:6px;" />
+        <button id="routeBtn">Route to Destination</button>
       </div>
       <div class="grid">
         <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
@@ -949,6 +934,12 @@ async def dashboard():
             const lj = await lr.json();
             locationsCache = lj.locations || {};
           } catch(e) { locationsCache = {}; }
+          // Auto-start: select first up to 3 and start streaming
+          try {
+            const cbs = Array.from(document.querySelectorAll('#list input[type=checkbox]')).slice(0,3);
+            cbs.forEach(cb => cb.checked = true);
+            setTimeout(startSelected, 200);
+          } catch(_){ }
         }
 
         function stopAll() {
@@ -958,13 +949,12 @@ async def dashboard():
 
         function startSelected() {
           stopAll();
-          const det = document.getElementById('det').value;
           const s = document.getElementById('stride').value || 2;
           const checked = Array.from(document.querySelectorAll('#list input[type=checkbox]:checked')).slice(0,3);
           const panels = [ ['p1','t1'], ['p2','t2'], ['p3','t3'] ];
           checked.forEach((c, idx) => {
             const [imgId, tId] = panels[idx];
-            document.getElementById(imgId).src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s + '&detector=' + det;
+            document.getElementById(imgId).src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s;
             document.getElementById(tId).textContent = c.value;
           });
 
@@ -1051,6 +1041,19 @@ async def dashboard():
         let lastSpeechText = '';
         const synth = window.speechSynthesis;
         let voiceList = [];
+        let geoWatchId = null; // geolocation watch id
+        // Persistence keys
+        const LS_KEYS = {
+          voiceEnabled: 'va_voice_enabled',
+          voiceLang: 'va_voice_lang',
+          voiceRate: 'va_voice_rate',
+          voiceStep: 'va_voice_step',
+          userLoc: 'va_user_loc',
+          destLoc: 'va_dest_loc'
+        };
+        // Route state for dynamic re-route
+        let lastWaypoints = null; // array of L.latLng
+        let lastRouteCoords = null; // array of {lat,lng}
 
         function populateVoices(){
           try{
@@ -1080,13 +1083,66 @@ async def dashboard():
           }
         }
 
+        function loadVoiceSettings(){
+          try{
+            const ve = localStorage.getItem(LS_KEYS.voiceEnabled);
+            if(ve !== null){ voiceEnabled = ve === '1'; document.getElementById('voiceToggle').checked = voiceEnabled; }
+            const vl = localStorage.getItem(LS_KEYS.voiceLang);
+            if(vl){ voiceLang = vl; const sel = document.getElementById('voiceLang'); if(sel) sel.value = vl; }
+            const vr = localStorage.getItem(LS_KEYS.voiceRate);
+            if(vr){ const v = parseFloat(vr); if(!isNaN(v)){ voiceRate = v; const r = document.getElementById('voiceRate'); if(r) r.value = String(v); } }
+            const vs = localStorage.getItem(LS_KEYS.voiceStep);
+            if(vs !== null){ voiceStepMode = vs === '1'; const cb = document.getElementById('voiceStep'); if(cb) cb.checked = voiceStepMode; }
+          }catch(_){}
+        }
+        function saveVoiceSettings(){
+          try{
+            localStorage.setItem(LS_KEYS.voiceEnabled, voiceEnabled ? '1' : '0');
+            localStorage.setItem(LS_KEYS.voiceLang, voiceLang || '');
+            localStorage.setItem(LS_KEYS.voiceRate, String(voiceRate));
+            localStorage.setItem(LS_KEYS.voiceStep, voiceStepMode ? '1' : '0');
+          }catch(_){}}
+
+        function loadUserLoc(){
+          try{
+            const s = localStorage.getItem(LS_KEYS.userLoc);
+            if(!s) return;
+            const obj = JSON.parse(s);
+            if(obj && typeof obj.lat==='number' && typeof obj.lon==='number'){
+              placeUser(obj.lat, obj.lon, null);
+            }
+          }catch(_){}}
+        function saveUserLoc(lat, lon){
+          try{ localStorage.setItem(LS_KEYS.userLoc, JSON.stringify({lat, lon})); }catch(_){}}
+
+        function loadDest(){
+          try{
+            const s = localStorage.getItem(LS_KEYS.destLoc);
+            if(!s) return;
+            const obj = JSON.parse(s);
+            if(obj && typeof obj.lat==='number' && typeof obj.lon==='number'){
+              if(destMarker){ destMarker.setLatLng([obj.lat, obj.lon]); }
+              else { destMarker = L.marker([obj.lat, obj.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); }
+              if(destCircle){ destCircle.setLatLng([obj.lat, obj.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+              else { destCircle = L.circle([obj.lat, obj.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+              const tf = document.getElementById('dest'); if(tf) tf.value = obj.name || '';
+            }
+          }catch(_){}}
+        function saveDest(lat, lon, name){
+          try{ localStorage.setItem(LS_KEYS.destLoc, JSON.stringify({lat, lon, name: name||''})); }catch(_){}}
+
+        // Load persisted settings/state after DOM is ready
+        loadVoiceSettings();
+        loadUserLoc();
+        loadDest();
+
         function speak(text){
           try{
             if(!voiceEnabled || !text || !('speechSynthesis' in window)) return;
             // Stop any ongoing speech
             synth.cancel();
             const u = new SpeechSynthesisUtterance(text);
-            u.rate = voiceRate; u.pitch = 1.0; u.volume = 1.0;
+            u.rate = voiceRate; u.pitch = 1.0; u.volume = 1.0; u.lang = voiceLang || 'en-US';
             // choose voice by selected language
             const en = (voiceList || synth.getVoices() || []).find(v => v.lang === voiceLang) ||
                        (voiceList || synth.getVoices() || []).find(v => v.lang && v.lang.startsWith(voiceLang.split('-')[0])) ||
@@ -1102,16 +1158,20 @@ async def dashboard():
             if(!voiceEnabled) return;
             try{
               const route = e && e.routes && e.routes[0];
+              // cache coordinates for dynamic re-route
+              lastRouteCoords = route && route.coordinates ? route.coordinates.map(p=>({lat:p.lat,lng:p.lng})) : null;
               const parts = [];
               if(route){
                 const hasSteps = route.instructions && route.instructions.length;
                 if(voiceStepMode && hasSteps){
                   parts.push('Starting navigation.');
+
                   route.instructions.forEach((ins, idx) => {
                     if(!ins) return;
                     let t = ins.text || '';
                     parts.push(`Step ${idx+1}. ${t}`);
                   });
+
                 }
                 // Always include summary at end
                 if(route.summary){
@@ -1130,20 +1190,138 @@ async def dashboard():
         document.getElementById('voiceToggle').addEventListener('change', (e)=>{
           voiceEnabled = !!e.target.checked;
           if(!voiceEnabled && synth){ synth.cancel(); }
+          saveVoiceSettings();
+          if(voiceEnabled){
+            // simple confirmation to validate audio works post user gesture
+            setTimeout(()=>{ try{ speak('Voice guidance enabled'); }catch(_){ } }, 100);
+          }
         });
         document.getElementById('voiceLang').addEventListener('change', (e)=>{
           voiceLang = e.target.value || 'en';
+          saveVoiceSettings();
         });
         document.getElementById('voiceRate').addEventListener('input', (e)=>{
           const v = parseFloat(e.target.value);
           if(!isNaN(v)) voiceRate = v;
+          saveVoiceSettings();
         });
         document.getElementById('voiceStep').addEventListener('change', (e)=>{
           voiceStepMode = !!e.target.checked;
+          saveVoiceSettings();
         });
         document.getElementById('voiceRepeat').addEventListener('click', ()=>{
           if(lastSpeechText) speak(lastSpeechText);
         });
+        document.getElementById('voiceStop').addEventListener('click', ()=>{
+          try{ synth.cancel(); }catch(_){}}
+        );
+
+        // Safer-routing helpers and state
+        const AVOID_DISTANCE_METERS = 1000; // target distance to move away from crowds
+        let destMarker = null; // single destination marker
+        let destCircle = null; // destination vicinity radius
+
+        function toRad(d){ return d * Math.PI / 180; }
+        function toDeg(r){ return r * 180 / Math.PI; }
+        function destPoint(lat, lon, bearingDeg, distanceMeters){
+          const R = 6371000; // Earth radius m
+          const br = toRad(bearingDeg);
+          const φ1 = toRad(lat);
+          const λ1 = toRad(lon);
+          const δ = distanceMeters / R;
+          const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
+          const sinδ = Math.sin(δ), cosδ = Math.cos(δ);
+          const sinφ2 = sinφ1 * cosδ + cosφ1 * sinδ * Math.cos(br);
+          const φ2 = Math.asin(sinφ2);
+          const y = Math.sin(br) * sinδ * cosφ1;
+          const x = cosδ - sinφ1 * sinφ2;
+          const λ2 = λ1 + Math.atan2(y, x);
+          return { lat: toDeg(φ2), lon: toDeg(λ2) };
+        }
+
+        // Collect CRITICAL markers near either of two centers
+        function collectCriticalNearAny(u, d){
+          const crit = [];
+          markers.forEach(({ marker }) => {
+            const mll = marker.getLatLng();
+            let near = false;
+            if(u){ near = near || (map.distance(mll, u) <= USER_RADIUS_METERS); }
+            if(d){ near = near || (map.distance(mll, d) <= USER_RADIUS_METERS); }
+            if(!near) return;
+            const content = marker.getPopup() && marker.getPopup().getContent();
+            if(typeof content === 'string' && content.includes('CRITICAL')){
+              crit.push([mll.lat, mll.lng]);
+            }
+          });
+          return crit;
+        }
+
+        // Coarse route safety check: any critical marker within threshold to route vertices
+        function isRouteUnsafe(routeCoords, crit, thresholdMeters = 200){
+          if(!crit.length || !routeCoords || !routeCoords.length) return false;
+          for(const c of crit){
+            const cll = L.latLng(c[0], c[1]);
+            for(const rc of routeCoords){
+              const rll = L.latLng(rc.lat, rc.lng);
+              if(map.distance(cll, rll) <= thresholdMeters){ return true; }
+            }
+          }
+          return false;
+        }
+
+        function computeDetourWaypoint(u, dest, crit){
+          if(!crit.length) return null;
+          const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+          const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+          // Vector from user to centroid -> perpendicular
+          const vx = cx - u.lat;
+          const vy = cy - u.lng;
+          let px = vy, py = -vx;
+          const norm = Math.hypot(px, py) || 1;
+          px /= norm; py /= norm;
+          const perpBearing = toDeg(Math.atan2(py, px));
+          const detour = destPoint(u.lat, u.lng, perpBearing, AVOID_DISTANCE_METERS);
+          return L.latLng(detour.lat, detour.lon);
+        }
+
+        let rerouteGuard = false;
+        function createRouterWithSafety(waypoints){
+          if(router){ map.removeControl(router); router=null; }
+          router = L.Routing.control({
+            waypoints,
+            routeWhileDragging: false,
+            addWaypoints: false,
+            draggableWaypoints: false,
+            createMarker: () => null,
+          }).addTo(map);
+          lastWaypoints = waypoints.slice();
+          attachVoice(router);
+          router.on('routesfound', (e) => {
+            try{
+              const route = e.routes && e.routes[0];
+              if(!route) return;
+              const coords = (route.coordinates||[]).map(p => ({ lat: p.lat, lng: p.lng }));
+              const u = waypoints[0];
+              const d = waypoints[waypoints.length-1];
+              const crit = collectCriticalNearAny(u, d);
+              if(isRouteUnsafe(coords, crit) && !rerouteGuard){
+                rerouteGuard = true;
+                const detour = computeDetourWaypoint(u, d, crit);
+                if(detour){ createRouterWithSafety([ L.latLng(u.lat, u.lng), detour, L.latLng(d.lat, d.lng) ]); }
+                setTimeout(() => { rerouteGuard = false; }, 1000);
+              }
+            }catch(_){ /* ignore */ }
+          });
+        }
+
+        async function geocodeOnce(q){
+          const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=1`;
+          const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+          if(!resp.ok) throw new Error('geocoding failed');
+          const arr = await resp.json();
+          if(!arr || !arr.length) throw new Error('no results');
+          return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon), name: arr[0].display_name };
+        }
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -1162,8 +1340,8 @@ async def dashboard():
             const r = await fetch('/congestion?include_idle=0');
             const j = await r.json();
             if(!j.items) return;
-            // If user location is not set, hide all markers.
-            if(!userMarker){
+            // If neither user nor destination is set, hide all markers.
+            if(!userMarker && !destMarker){
               if(markers.size){
                 markers.forEach(({ marker }) => { map.removeLayer(marker); });
                 markers.clear();
@@ -1171,12 +1349,15 @@ async def dashboard():
               setTimeout(poll, 3000);
               return;
             }
-            const u = userMarker.getLatLng();
+            const u = userMarker ? userMarker.getLatLng() : null;
+            const dLL = destMarker ? destMarker.getLatLng() : null;
             j.items.forEach(it => {
               if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
               const key = it.filename;
-              const dist = map.distance(L.latLng(it.lat, it.lon), u);
-              const inRange = dist <= USER_RADIUS_METERS;
+              const mll = L.latLng(it.lat, it.lon);
+              let inRange = false;
+              if(u){ inRange = inRange || (map.distance(mll, u) <= USER_RADIUS_METERS); }
+              if(dLL){ inRange = inRange || (map.distance(mll, dLL) <= USER_RADIUS_METERS); }
               if(!inRange){
                 if(markers.has(key)){
                   const { marker } = markers.get(key);
@@ -1203,31 +1384,71 @@ async def dashboard():
                   if(userMarker){
                     const u = userMarker.getLatLng();
                     if(router){ map.removeControl(router); router=null; }
-                    router = L.Routing.control({
-                      waypoints: [ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ],
-                      routeWhileDragging: false,
-                    }).addTo(map);
-                    attachVoice(router);
+                    createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ]);
                     return;
                   }
                   // Fallback to original 2-click routing between markers
                   if(selected.length === 2){ selected = []; if(router){ map.removeControl(router); router=null; } }
                   selected.push([it.lat, it.lon]);
                   if(selected.length === 2){
-                    router = L.Routing.control({
-                      waypoints: [ L.latLng(selected[0][0], selected[0][1]), L.latLng(selected[1][0], selected[1][1]) ],
-                      routeWhileDragging: false,
-                    }).addTo(map);
-                    attachVoice(router);
+                    createRouterWithSafety([ L.latLng(selected[0][0], selected[0][1]), L.latLng(selected[1][0], selected[1][1]) ]);
                   }
                 });
                 markers.set(key, { marker });
               }
             });
+            // Dynamic re-route if new CRITICAL markers appear along current route
+            if(router && lastWaypoints && lastRouteCoords && userMarker){
+              try{
+                const u = lastWaypoints[0];
+                const d = lastWaypoints[lastWaypoints.length-1];
+                const crit = collectCriticalNearAny(u, d);
+                if(isRouteUnsafe(lastRouteCoords, crit) && !rerouteGuard){
+                  rerouteGuard = true;
+                  createRouterWithSafety(lastWaypoints);
+                  setTimeout(() => { rerouteGuard = false; }, 1000);
+                }
+              }catch(_){ }
+            }
+            // Toggle Avoid button visibility based on nearby CRITICAL markers
+            const ab = document.getElementById('avoidBtn');
+            if(ab && userMarker){
+              // quick proximity check using current markers and user
+              const u = userMarker.getLatLng();
+
+              let anyCritical = false;
+              markers.forEach(({ marker }) => {
+                const mll = marker.getLatLng();
+                if(map.distance(mll, u) <= USER_RADIUS_METERS){
+                  const content = marker.getPopup() && marker.getPopup().getContent();
+                  if(typeof content === 'string' && content.includes('CRITICAL')){
+                    anyCritical = true;
+                  }
+                }
+              });
+              ab.style.display = anyCritical ? 'inline-block' : 'none';
+            }
           }catch(e){/* ignore */}
           setTimeout(poll, 3000);
         }
         poll();
+
+        function onUserMoved(){
+          try{
+            if(!router) return;
+            const u = userMarker && userMarker.getLatLng();
+            if(!u) return;
+            let destLatLng = null;
+            if(destMarker){ destLatLng = destMarker.getLatLng(); }
+            else if(lastWaypoints && lastWaypoints.length >= 2){
+              const d = lastWaypoints[lastWaypoints.length-1];
+              destLatLng = L.latLng(d.lat, d.lng);
+            }
+            if(destLatLng){
+              createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(destLatLng.lat, destLatLng.lng) ]);
+            }
+          }catch(_){ }
+        }
 
         function placeUser(lat, lon, accuracy){
           const latlng = L.latLng(lat, lon);
@@ -1239,6 +1460,8 @@ async def dashboard():
               if(userCircle){ userCircle.setLatLng(ll); }
               const tf = document.getElementById('uloc');
               if(tf) tf.value = `${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}`;
+              saveUserLoc(ll.lat, ll.lng);
+              onUserMoved();
             });
           }
           if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
@@ -1248,6 +1471,39 @@ async def dashboard():
           // Sync text field
           const tf = document.getElementById('uloc');
           if(tf) tf.value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+          saveUserLoc(lat, lon);
+          onUserMoved();
+        }
+
+        function updateUserLive(lat, lon){
+          const latlng = L.latLng(lat, lon);
+          if(userMarker){ userMarker.setLatLng(latlng); }
+          if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
+          saveUserLoc(lat, lon);
+          onUserMoved();
+        }
+
+        function startGeoWatch(){
+          try{
+            if(!navigator.geolocation) return;
+            if(geoWatchId !== null) return;
+            geoWatchId = navigator.geolocation.watchPosition(
+              (pos) => {
+                const { latitude, longitude } = pos.coords;
+                updateUserLive(latitude, longitude);
+              },
+              (_err) => {},
+              { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000 }
+            );
+          }catch(_){ geoWatchId = null; }
+        }
+        function stopGeoWatch(){
+          try{
+            if(geoWatchId !== null && navigator.geolocation && navigator.geolocation.clearWatch){
+              navigator.geolocation.clearWatch(geoWatchId);
+            }
+          }catch(_){ }
+          geoWatchId = null;
         }
 
         document.getElementById('useLoc').onclick = async () => {
@@ -1256,6 +1512,7 @@ async def dashboard():
             (pos) => {
               const { latitude, longitude, accuracy } = pos.coords;
               placeUser(latitude, longitude, accuracy);
+              startGeoWatch();
             },
             (err) => { alert('Failed to get location: ' + err.message); },
             { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
@@ -1281,6 +1538,54 @@ async def dashboard():
           }catch(e){ alert('Geocoding error'); }
         }
         document.getElementById('geocode').onclick = geocodeAndPlace;
+
+        document.getElementById('routeBtn').onclick = async () => {
+          if(!userMarker){ alert('Set your current location first'); return; }
+          const q = (document.getElementById('dest').value || '').trim();
+          if(!q){ alert('Enter a destination'); return; }
+          try{
+            const dest = await geocodeOnce(q);
+            const u = userMarker.getLatLng();
+            const waypoints = [ L.latLng(u.lat, u.lng), L.latLng(dest.lat, dest.lon) ];
+            createRouterWithSafety(waypoints);
+            if(destMarker){ destMarker.setLatLng([dest.lat, dest.lon]); }
+            else { destMarker = L.marker([dest.lat, dest.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); }
+            if(destCircle){ destCircle.setLatLng([dest.lat, dest.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+            else { destCircle = L.circle([dest.lat, dest.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+            saveDest(dest.lat, dest.lon, dest.name);
+            startGeoWatch();
+          }catch(e){ alert('Failed to route to destination: ' + e.message); }
+        };
+
+        document.getElementById('avoidBtn').onclick = () => {
+          if(!userMarker) return;
+          const u = userMarker.getLatLng();
+          // Collect CRITICAL markers near user
+          const crit = [];
+          markers.forEach(({ marker }) => {
+            const mll = marker.getLatLng();
+            if(map.distance(mll, u) <= USER_RADIUS_METERS){
+              const content = marker.getPopup() && marker.getPopup().getContent();
+              if(typeof content === 'string' && content.includes('CRITICAL')) crit.push([mll.lat, mll.lng]);
+            }
+          });
+          if(!crit.length) return;
+          // Compute bearing away from centroid
+          const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+          const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+          const dy = toRad(cx - u.lat);
+          const dx = toRad(cy - u.lng) * Math.cos(toRad((u.lat+cx)/2));
+          const bearingToCrowd = Math.atan2(dx, dy);
+          const bearingAwayDeg = (toDeg(bearingToCrowd) + 180) % 360;
+          const dest = destPoint(u.lat, u.lng, bearingAwayDeg, AVOID_DISTANCE_METERS);
+          if(destMarker){ destMarker.setLatLng([dest.lat, dest.lon]); }
+          else { destMarker = L.marker([dest.lat, dest.lon], { title: 'Suggested safer route' }).addTo(map).bindPopup('Suggested safer route'); }
+          if(destCircle){ destCircle.setLatLng([dest.lat, dest.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+          else { destCircle = L.circle([dest.lat, dest.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+          destMarker.openPopup();
+          createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(dest.lat, dest.lon) ]);
+          saveDest(dest.lat, dest.lon, 'Suggested safer route');
+        };
 
         document.getElementById('pickOnMap').onclick = () => {
           pickMode = !pickMode;
@@ -1308,7 +1613,7 @@ async def dashboard():
     return HTMLResponse(content=html)
 
 @app.post("/videos/analyze/seconds")
-async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str = 'hog'):
+async def analyze_per_second(filename: str, frame_stride: int = 5):
     items = _list_demo_videos()
     targets = [it for it in items if it["filename"] == filename]
     if not targets:
@@ -1318,9 +1623,8 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail=f"Failed to open video: {filename}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    if detector not in {"hog", "yolo"}:
-        raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
-    hog = _hog_detector() if detector != 'yolo' else None
+    if YOLO is None:
+        raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
     idx = 0
     per_sec: Dict[int, int] = {}
     try:
@@ -1331,10 +1635,7 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
             if frame_stride > 1 and (idx % frame_stride) != 0:
                 idx += 1
                 continue
-            if detector == 'yolo':
-                rects = _yolo_detect(frame, conf=0.35, iou=0.5, imgsz=640)
-            else:
-                rects = _hog_detect(frame, hog, win_stride=(8, 8), padding=(8, 8), scale=1.05)
+            rects = _yolo_detect(frame, conf=0.35, iou=0.5, imgsz=640)
             count = len(rects) if rects else 0
             sec = int(idx / fps) if fps and fps > 0 else 0
             per_sec[sec] = per_sec.get(sec, 0) + count
@@ -1451,136 +1752,6 @@ async def congestion_feed(include_idle: int = 0):
                     payload["density_m2"] = 0.0
                 items.append(payload)
     return JSONResponse({"items": items})
-
-
-from fastapi.responses import HTMLResponse
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    html = """
-    <html>
-    <head>
-        <title>Crowd Safety Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    </head>
-    <body style="font-family:sans-serif; background:#f7f7f7; text-align:center;">
-        <h1>🎥 Crowd Safety Intelligence Dashboard</h1>
-        <button onclick="analyze()">🔮 Run Predictive Analysis</button>
-        <canvas id="densityChart" width="600" height="300"></canvas>
-        <div id="alerts"></div>
-
-        <script>
-        async function analyze() {
-            const res = await fetch('/videos/analyze/demo', { method: 'POST' });
-            const data = await res.json();
-
-            const ctx = document.getElementById('densityChart').getContext('2d');
-            const labels = [...Array(data.historical_density.length + data.predicted_density.length).keys()].map(i => i*5);
-            const densities = [...data.historical_density, ...data.predicted_density];
-
-            new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels,
-                    datasets: [{
-                        label: 'Crowd Density (past + predicted)',
-                        data: densities,
-                        borderColor: 'red',
-                        borderWidth: 2,
-                        fill: false
-                    }]
-                },
-                options: { scales: { y: { beginAtZero: true } } }
-            });
-
-            const alertDiv = document.getElementById('alerts');
-            alertDiv.innerHTML = "<h3>🔔 Predicted Alerts</h3>" + data.alerts.map(a =>
-                `<p>${a.time}s — ${a.risk_level}: ${a.message}</p>`).join('');
-        }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html)
-
-
-config = {
-    "density_threshold": 10,
-    "panic_threshold": 0.5,
-    "panic_window": 10,
-    "panic_scale": 5,
-    "predict_alert_enabled": 0,
-    "predict_horizon_sec": 10,
-    "predict_window_sec": 30,
-    "alert_cooldown_sec": 10,
-}
-
-@app.post("/alerts/config")
-async def set_config(
-    density_threshold: Optional[float] = None,
-    panic_threshold: Optional[float] = None,
-    panic_window: Optional[int] = None,
-    panic_scale: Optional[float] = None,
-    predict_alert_enabled: Optional[int] = None,
-    predict_horizon_sec: Optional[int] = None,
-    predict_window_sec: Optional[int] = None,
-    alert_cooldown_sec: Optional[int] = None,
-):
-    # Update configuration dynamically
-    for k, v in locals().items():
-        if v is not None and k != "app":
-            config[k] = v
-    return {"status": "ok", "config": config}
-
-@app.get("/alerts/config")
-async def get_config():
-    return {"config": config}
-
-
-
-from datetime import datetime
-
-@app.get("/alerts/latest")
-def latest_alert():
-    return {
-        "latest": {
-            "time": datetime.now().isoformat(),
-            "severity": "SAFE",
-            "source": "system",
-            "message": "No crowd anomalies detected."
-        }
-    }
-
-
-
-
-from fastapi.responses import JSONResponse
-import random
-
-@app.get("/congestion")
-def get_congestion(include_idle: int = 0):
-    """
-    Returns simulated crowd congestion data for dashboard map.
-    Now includes predicted density (`pred_density_mp`) for each zone.
-    """
-    areas = ["Gate A", "Stage Front", "Corridor 3", "Exit Zone"]
-    data = []
-    for area in areas:
-        curr_density = round(random.uniform(5, 20), 2)
-        pred_density = round(curr_density + random.uniform(-2, 4), 2)
-        severity = (
-            "critical" if pred_density > 18 else
-            "moderate" if pred_density > 12 else
-            "safe"
-        )
-        data.append({
-            "area": area,
-            "density_now": curr_density,
-            "pred_density_mp": pred_density,
-            "severity": severity
-        })
-
-    return JSONResponse({"zones": data})
 
 if __name__ == "__main__":
     # For local testing: python main.py
