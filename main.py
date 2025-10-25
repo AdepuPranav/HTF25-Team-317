@@ -6,6 +6,7 @@ import tempfile
 import os
 import time
 import asyncio
+import json
 from typing import Dict, List, Optional
 from collections import deque
 from datetime import datetime
@@ -43,16 +44,54 @@ async def root():
 # Each config: {"location_id": str, "area_m2": float, "roi": List[[x,y], ...], "lat": float, "lon": float}
 LOCATION_CONFIGS: Dict[str, Dict[str, object]] = {}
 
+# Persisted locations file
+LOCATIONS_DB = "locations.json"
+
+def _load_locations() -> None:
+    try:
+        if os.path.isfile(LOCATIONS_DB):
+            with open(LOCATIONS_DB, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    # Basic validation per entry
+                    for k, v in list(data.items()):
+                        if not isinstance(v, dict):
+                            del data[k]
+                    LOCATION_CONFIGS.update(data)
+    except Exception:
+        pass
+
+# Load persisted locations after helpers and dict are defined
+_load_locations()
+
+def _save_locations() -> None:
+    try:
+        with open(LOCATIONS_DB, "w", encoding="utf-8") as f:
+            json.dump(LOCATION_CONFIGS, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # Global live metrics per filename for map/dashboard
 # { filename: { ts, location_id, count, density_mp, density_m2 (optional), lat, lon, severity } }
 GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
 
+# Per-source severity smoothing and cooldown state
+SEVERITY_STATE: Dict[str, Dict[str, object]] = {}
+
 # Alerts config and state
 CONFIG: Dict[str, float] = {
     "density_threshold": 12.0,
+    "density_threshold_m2": 2.5,
     "panic_threshold": 0.7,
     "panic_window": 10,
     "panic_scale": 8.0,
+    "ema_alpha": 0.4,
+    "hysteresis_margin": 0.15,
+    "alert_cooldown_sec": 10.0,
+    "occupancy_mod_threshold": 0.18,
+    "occupancy_crit_threshold": 0.32,
+    "occupancy_boost": 1.2,
+    "min_people_for_critical": 4,
 }
 ALERT_STATE: Dict[str, object] = {"latest": None, "by_source": {}}
 
@@ -216,7 +255,7 @@ def _get_yolo():
         _YOLO_MODEL = YOLO('yolov8n.pt')
     return _YOLO_MODEL
 
-def _yolo_detect(frame, conf: float = 0.3, iou: float = 0.5, imgsz: int = 640):
+def _yolo_detect(frame, conf: float = 0.25, iou: float = 0.5, imgsz: int = 960):
     model = _get_yolo()
     res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
     boxes = []
@@ -231,6 +270,65 @@ def _yolo_detect(frame, conf: float = 0.3, iou: float = 0.5, imgsz: int = 640):
             except Exception:
                 continue
     return boxes
+
+def _nms_boxes(boxes: List[tuple], iou_thresh: float = 0.5) -> List[tuple]:
+    if not boxes:
+        return []
+    # boxes: (x, y, w, h)
+    b2 = [(x, y, x + w, y + h) for (x, y, w, h) in boxes]
+    areas = [max(1, (x2 - x1) * (y2 - y1)) for (x1, y1, x2, y2) in b2]
+    order = sorted(range(len(b2)), key=lambda i: areas[i], reverse=True)
+    keep = []
+    while order:
+        i = order.pop(0)
+        keep.append(i)
+        x1, y1, x2, y2 = b2[i]
+        remain = []
+        for j in order:
+            xx1 = max(x1, b2[j][0]); yy1 = max(y1, b2[j][1])
+            xx2 = min(x2, b2[j][2]); yy2 = min(y2, b2[j][3])
+            w = max(0, xx2 - xx1); h = max(0, yy2 - yy1)
+            inter = w * h
+            union = areas[i] + areas[j] - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou < iou_thresh:
+                remain.append(j)
+        order = remain
+    return [boxes[i] for i in keep]
+
+def _detect_people(frame, detector: str = 'hog') -> List[tuple]:
+    h, w = frame.shape[:2]
+    boxes: List[tuple] = []
+    if detector == 'yolo':
+        try:
+            boxes += _yolo_detect(frame, conf=0.25, iou=0.5, imgsz=960)
+        except Exception:
+            pass
+    else:
+        hog = _hog_detector()
+        boxes += _hog_detect(frame, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+    # Tiled 2x2 pass to capture smaller/occluded persons in crowded scenes
+    tiles = [
+        (0, 0, w // 2, h // 2),
+        (w // 2, 0, w - w // 2, h // 2),
+        (0, h // 2, w // 2, h - h // 2),
+        (w // 2, h // 2, w - w // 2, h - h // 2),
+    ]
+    for (tx, ty, tw, th) in tiles:
+        if tw < 160 or th < 160:
+            continue
+        crop = frame[ty:ty + th, tx:tx + tw]
+        if detector == 'yolo':
+            try:
+                b2 = _yolo_detect(crop, conf=0.22, iou=0.5, imgsz=960)
+            except Exception:
+                b2 = []
+        else:
+            hog = _hog_detector()
+            b2 = _hog_detect(crop, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+        for (x, y, rw, rh) in b2:
+            boxes.append((x + tx, y + ty, rw, rh))
+    return _nms_boxes(boxes, iou_thresh=0.45)
 
 def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 960, detector: str = 'hog') -> Dict[str, object]:
     cap = cv2.VideoCapture(path)
@@ -330,6 +428,7 @@ async def list_demo_videos():
             if "lat" not in cfg0: cfg0["lat"] = 17.4399
             if "lon" not in cfg0: cfg0["lon"] = 78.4983
             LOCATION_CONFIGS[f0] = cfg0
+            _save_locations()
         if len(items) >= 2:
             f1 = items[1]["filename"]
             cfg1 = LOCATION_CONFIGS.get(f1, {})
@@ -339,6 +438,7 @@ async def list_demo_videos():
             if "lat" not in cfg1: cfg1["lat"] = 17.4056
             if "lon" not in cfg1: cfg1["lon"] = 78.5596
             LOCATION_CONFIGS[f1] = cfg1
+            _save_locations()
     except Exception:
         pass
     return JSONResponse({"videos": items})
@@ -394,6 +494,7 @@ async def list_all_sources():
                     "lon": float(lon),
                 }
                 used.add((float(lat), float(lon)))
+                _save_locations()
     except Exception:
         pass
     return JSONResponse({"local": local, "blob": blobs})
@@ -457,6 +558,67 @@ def _point_in_polygon(x: int, y: int, poly: List[List[int]]) -> bool:
             inside = not inside
     return inside
 
+def _polygon_area(poly: List[List[int]]) -> float:
+    n = len(poly)
+    if n < 3:
+        return 0.0
+    s = 0.0
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        s += (x1 * y2) - (x2 * y1)
+    return abs(s) * 0.5
+
+def _severity_for_density(density: float, per_m2: bool, mp_threshold: float, m2_threshold: float) -> Dict[str, object]:
+    if per_m2:
+        if density <= (0.4 * m2_threshold):
+            return {"label": "SAFE", "color": (0, 200, 0)}
+        if density <= m2_threshold:
+            return {"label": "MODERATE", "color": (0, 215, 255)}
+        return {"label": "CRITICAL", "color": (0, 0, 255)}
+    else:
+        if density <= (0.6 * mp_threshold):
+            return {"label": "SAFE", "color": (0, 200, 0)}
+        if density <= mp_threshold:
+            return {"label": "MODERATE", "color": (0, 215, 255)}
+        return {"label": "CRITICAL", "color": (0, 0, 255)}
+
+def _update_severity_with_hysteresis(source: str, dens_value: float, per_m2: bool, mp_thr: float, m2_thr: float) -> Dict[str, object]:
+    state = SEVERITY_STATE.get(source, {"ema": None, "last": "SAFE", "last_change": 0.0, "last_alert": 0.0})
+    alpha = float(CONFIG.get("ema_alpha", 0.4) or 0.4)
+    ema_prev = state.get("ema")
+    ema = (alpha * dens_value) + ((1 - alpha) * ema_prev) if isinstance(ema_prev, (int, float)) else dens_value
+    margin = float(CONFIG.get("hysteresis_margin", 0.15) or 0.15)
+    thr = float(m2_thr if per_m2 else mp_thr)
+    # Base bands
+    safe_up = 0.6 * thr
+    mod_up = thr
+    # Hysteresis for downgrades (require a margin below boundaries)
+    safe_dn = safe_up * (1 - margin)
+    mod_dn = mod_up * (1 - margin)
+    last = state.get("last") or "SAFE"
+    label = last
+    if last == "SAFE":
+        if ema >= mod_up:
+            label = "CRITICAL"
+        elif ema >= safe_up:
+            label = "MODERATE"
+    elif last == "MODERATE":
+        if ema >= mod_up:
+            label = "CRITICAL"
+        elif ema < safe_dn:
+            label = "SAFE"
+    else:  # last == CRITICAL
+        if ema < mod_dn:
+            label = "MODERATE" if ema >= safe_up else "SAFE"
+    if label != last:
+        state["last_change"] = time.time()
+    state["ema"] = float(ema)
+    state["last"] = label
+    SEVERITY_STATE[source] = state
+    color = (0, 200, 0) if label == "SAFE" else ((0, 215, 255) if label == "MODERATE" else (0, 0, 255))
+    return {"label": label, "color": color, "ema": ema}
+
 def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog'):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -487,6 +649,7 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             "lon": float(lon),
         }
         LOCATION_CONFIGS[filename] = cfg
+        _save_locations()
     # alert history window for panic index
     panic_window = int(CONFIG.get("panic_window", 10) or 10)
     recent_counts: deque = deque(maxlen=panic_window)
@@ -506,10 +669,7 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
                 ratio = resize_width / float(frame.shape[1])
                 new_h = int(frame.shape[0] * ratio)
                 frame = cv2.resize(frame, (resize_width, new_h))
-            if detector == 'yolo':
-                rects = _yolo_detect(frame, conf=0.35, iou=0.5, imgsz=640)
-            else:
-                rects = _hog_detect(frame, hog, hit_threshold=0.0, win_stride=(6, 6), padding=(8, 8), scale=1.05, nms_thresh=0.3)
+            rects = _detect_people(frame, detector=detector)
             count = 0
             if rects:
                 # If ROI is defined, filter boxes whose center lies inside ROI
@@ -528,26 +688,96 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
 
             # Overlay banner with severity and count
             h, w = frame.shape[:2]
-            sev = _severity_for_count(count)
+            # Compute density per effective area (ROI if present)
+            area_mp = (w * h) / 1_000_000.0 if w and h else 0.0
+            if cfg and isinstance(cfg.get("roi"), list) and len(cfg.get("roi")) >= 3:
+                roi_px = _polygon_area(cfg.get("roi"))
+                eff_mp = (roi_px / 1_000_000.0) if roi_px and roi_px > 0 else area_mp
+            else:
+                eff_mp = area_mp
+            dens = (count / eff_mp) if eff_mp else 0.0
+
+            # Occupancy: fraction of effective pixel area covered by detected boxes
+            eff_px = 0.0
+            if cfg and isinstance(cfg.get("roi"), list) and len(cfg.get("roi")) >= 3 and roi_px and roi_px > 0:
+                eff_px = float(roi_px)
+            else:
+                eff_px = float(w * h)
+            occ = 0.0
+            if eff_px > 0 and rects:
+                # Use filtered boxes (already ROI-clipped by center) to approximate coverage
+                total_person_px = 0.0
+                for (bx, by, bw, bh) in (filtered if 'filtered' in locals() and filtered else rects):
+                    total_person_px += float(max(0, bw) * max(0, bh))
+                occ = min(1.0, total_person_px / eff_px)
+
+            # Temporal stabilization: reduce effect of transient undercounts
+            try:
+                import numpy as _np
+                hist = list(recent_counts) + [count]
+                count_for_decision = int(_np.percentile(hist, 75)) if hist else count
+            except Exception:
+                count_for_decision = count
+
+            # Choose severity metric: m^2 preferred if area is calibrated
+            use_m2 = False
+            dens_m2 = None
+            if cfg and isinstance(cfg.get("area_m2"), (int, float)) and float(cfg.get("area_m2") or 0) > 0:
+                use_m2 = True
+                area_m2 = float(cfg.get("area_m2"))
+                dens_m2 = (count_for_decision / area_m2)
+            mp_thr = float(CONFIG.get("density_threshold", 12.0) or 12.0)
+            m2_thr = float(CONFIG.get("density_threshold_m2", 2.5) or 2.5)
+            # Use decision density for severity/alerts with EMA + hysteresis
+            decision_dens = (count_for_decision / eff_mp) if eff_mp else dens
+            # Occupancy-aware boost to decision density
+            try:
+                occ_boost = float(CONFIG.get("occupancy_boost", 1.2) or 1.0)
+            except Exception:
+                occ_boost = 1.0
+            decision_dens_boosted = decision_dens * (1.0 + occ_boost * occ)
+            sev = _update_severity_with_hysteresis(filename, (dens_m2 if use_m2 and dens_m2 is not None else decision_dens_boosted), use_m2, mp_thr, m2_thr)
+
+            # Apply occupancy floor upgrades (force at least MODERATE/CRITICAL)
+            try:
+                occ_mod = float(CONFIG.get("occupancy_mod_threshold", 0.18) or 0.18)
+                occ_crit = float(CONFIG.get("occupancy_crit_threshold", 0.32) or 0.32)
+                min_crit = int(CONFIG.get("min_people_for_critical", 4) or 4)
+            except Exception:
+                occ_mod, occ_crit, min_crit = 0.18, 0.32, 4
+            upgrade_label = None
+            if occ >= occ_crit and count >= min_crit:
+                upgrade_label = "CRITICAL"
+            elif occ >= occ_mod and count >= 2:
+                upgrade_label = "MODERATE"
+            if upgrade_label:
+                order = {"SAFE": 0, "MODERATE": 1, "CRITICAL": 2}
+                if order.get(upgrade_label, 0) > order.get(sev.get('label', 'SAFE'), 0):
+                    sev['label'] = upgrade_label
+                    sev['color'] = (0, 200, 0) if upgrade_label == 'SAFE' else ((0, 215, 255) if upgrade_label == 'MODERATE' else (0, 0, 255))
+
             banner_h = max(30, h // 16)
             overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (w, banner_h), sev["color"], thickness=-1)
             alpha = 0.35
             frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-            # Density per megapixel (people/MP)
-            area_mp = (w * h) / 1_000_000.0 if w and h else 0.0
-            dens = (count / area_mp) if area_mp else 0.0
-            # Compute panic and record alert on threshold or CRITICAL severity
+            # Compute panic and record alert on threshold or CRITICAL severity (with cooldown)
             panic = _compute_panic_index(recent_counts, count)
             recent_counts.append(count)
-            if sev['label'] == 'CRITICAL' or dens > (CONFIG.get('density_threshold', 12.0) or 12.0) or panic > (CONFIG.get('panic_threshold', 0.7) or 0.7):
+            density_to_check = (dens_m2 if use_m2 and dens_m2 is not None else decision_dens_boosted)
+            thr = (m2_thr if use_m2 else mp_thr)
+            cooldown = float(CONFIG.get('alert_cooldown_sec', 10.0) or 10.0)
+            st = SEVERITY_STATE.get(filename, {})
+            last_alert = float(st.get('last_alert') or 0.0)
+            now = time.time()
+            should_alert = (sev['label'] == 'CRITICAL') or (density_to_check > thr) or (panic > (CONFIG.get('panic_threshold', 0.7) or 0.7))
+            if should_alert and (now - last_alert >= cooldown):
                 _record_alert(filename, count, dens, panic, 'CRITICAL' if sev['label'] == 'CRITICAL' else sev['label'])
+                st['last_alert'] = now
+                SEVERITY_STATE[filename] = st
 
             label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP"
-            # If location config includes true area, show people per m^2
-            if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
-                area_m2 = float(cfg["area_m2"])
-                dens_m2 = (count / area_m2) if area_m2 > 0 else 0.0
+            if use_m2 and dens_m2 is not None:
                 label += f" | {dens_m2:.2f}/m^2"
             cv2.putText(frame, label, (10, int(banner_h * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             # Optional timestamp/second estimate
