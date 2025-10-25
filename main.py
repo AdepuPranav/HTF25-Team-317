@@ -6,6 +6,14 @@ import tempfile
 import os
 import time
 from typing import Dict, List
+from azure_integrations import (
+    blob_enabled,
+    blob_upload_bytes,
+    blob_list_videos,
+    resolve_path_for_processing,
+    sb_enabled,
+    sb_send_json,
+)
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception:
@@ -83,6 +91,27 @@ async def analyze_video(file: UploadFile = File(...)):
         }
     )
 
+@app.post("/video/upload")
+async def upload_to_blob(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    if not blob_enabled():
+        raise HTTPException(status_code=500, detail="Blob storage not configured")
+    # Read and upload in chunks
+    size = 0
+    chunks = []
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    try:
+        blob_upload_bytes(file.filename, b"".join(chunks), overwrite=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to blob: {e}")
+    return JSONResponse({"ok": True, "blob": file.filename, "size": size})
+
 def _list_demo_videos() -> List[Dict[str, object]]:
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     items: List[Dict[str, object]] = []
@@ -130,12 +159,14 @@ def _get_yolo():
     if _YOLO_MODEL is None:
         if YOLO is None:
             raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
-        _YOLO_MODEL = YOLO('yolov8n.pt')
+        weights_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt')
+        _YOLO_MODEL = YOLO(weights_path)
     return _YOLO_MODEL
 
 def _yolo_detect(frame, conf: float = 0.3, iou: float = 0.5, imgsz: int = 640):
     model = _get_yolo()
-    res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
+    # Force CPU by default so it works without CUDA; lower imgsz if needed for speed.
+    res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, device='cpu', verbose=False)[0]
     boxes = []
     if res and hasattr(res, 'boxes') and res.boxes is not None:
         for b in res.boxes:
@@ -250,9 +281,22 @@ async def list_demo_videos():
         pass
     return JSONResponse({"videos": items})
 
+@app.get("/videos/source")
+async def list_all_sources():
+    local = _list_demo_videos()
+    try:
+        blobs = blob_list_videos()
+    except Exception:
+        blobs = []
+    return JSONResponse({"local": local, "blob": blobs})
+
 @app.post("/videos/analyze/demo")
 async def analyze_demo_videos(filename: str = None, frame_stride: int = 5, detector: str = 'hog'):
     items = _list_demo_videos()
+    try:
+        items += blob_list_videos()
+    except Exception:
+        pass
     if not items:
         raise HTTPException(status_code=400, detail="No demo videos found")
     targets: List[Dict[str, object]]
@@ -268,12 +312,18 @@ async def analyze_demo_videos(filename: str = None, frame_stride: int = 5, detec
         raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
     results: List[Dict[str, object]] = []
     for it in targets:
+        proc_path, cleanup = resolve_path_for_processing(it["path"])  # may be same path if local
         try:
-            res = _analyze_video_file(it["path"], frame_stride=frame_stride, detector=detector)
+            res = _analyze_video_file(proc_path, frame_stride=frame_stride, detector=detector)
         except HTTPException as e:
             raise e
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed analyzing {it['filename']}: {e}")
+        finally:
+            try:
+                cleanup()
+            except Exception:
+                pass
         results.append(res)
     return JSONResponse({"results": results})
 
@@ -416,6 +466,10 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
 @app.get("/videos/stream")
 async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str = 'hog'):
     items = _list_demo_videos()
+    try:
+        items += blob_list_videos()
+    except Exception:
+        pass
     if not any(it["filename"] == filename for it in items):
         raise HTTPException(status_code=404, detail="Requested filename not found or empty")
     path = next(it["path"] for it in items if it["filename"] == filename)
@@ -423,8 +477,18 @@ async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str 
         raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
     if detector == 'yolo' and YOLO is None:
         raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
-    gen = _stream_overlay(path, frame_stride=frame_stride, detector=detector)
-    return StreamingResponse(gen, media_type="multipart/x-mixed-replace; boundary=frame")
+    proc_path, cleanup = resolve_path_for_processing(path)
+    def _gen():
+        try:
+            gen = _stream_overlay(proc_path, frame_stride=frame_stride, detector=detector)
+            for chunk in gen:
+                yield chunk
+        finally:
+            try:
+                cleanup()
+            except Exception:
+                pass
+    return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/dashboard")
 async def dashboard():
@@ -474,13 +538,14 @@ async def dashboard():
       <script>
         let videos = [];
         async function load() {
-          const r = await fetch('/videos/demo');
+          const r = await fetch('/videos/source');
           const j = await r.json();
           const list = document.getElementById('list');
           list.innerHTML = '';
-          if (!j.videos || j.videos.length === 0) { list.textContent = 'No videos found.'; return; }
-          videos = j.videos;
-          j.videos.forEach((v, i) => {
+          const src = (j.blob || []);
+          if (!src || src.length === 0) { list.textContent = 'No blob videos found.'; return; }
+          videos = src;
+          src.forEach((v, i) => {
             const id = 'sel_' + i;
             const row = document.createElement('div');
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = id; cb.value = v.filename;
