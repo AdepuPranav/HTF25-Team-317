@@ -6,6 +6,8 @@ import tempfile
 import os
 import time
 from typing import Dict, List
+from collections import deque
+from datetime import datetime
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception:
@@ -20,6 +22,42 @@ LOCATION_CONFIGS: Dict[str, Dict[str, object]] = {}
 # Global live metrics per filename for map/dashboard
 # { filename: { ts, location_id, count, density_mp, density_m2 (optional), lat, lon, severity } }
 GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
+
+# Alerts config and state
+CONFIG: Dict[str, float] = {
+    "density_threshold": 12.0,
+    "panic_threshold": 0.7,
+    "panic_window": 10,
+    "panic_scale": 8.0,
+}
+ALERT_STATE: Dict[str, object] = {"latest": None, "by_source": {}}
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def _compute_panic_index(history: deque, current_count: int) -> float:
+    if not history:
+        return 0.0
+    avg = sum(history) / len(history)
+    diff = abs(current_count - avg)
+    scale = CONFIG.get("panic_scale", 8.0) or 1.0
+    v = diff / scale
+    return 0.0 if v < 0 else (1.0 if v > 1 else v)
+
+def _record_alert(source: str, count: int, density_per_mp: float, panic_index: float, severity: str):
+    alert = {
+        "time": _now_iso(),
+        "source": source,
+        "count": int(count),
+        "density_per_mp": round(density_per_mp, 3),
+        "panic_index": round(panic_index, 3),
+        "severity": severity,
+        "message": f"{severity}: density={density_per_mp:.2f}/MP, panic={panic_index:.2f}, count={count}",
+    }
+    ALERT_STATE["latest"] = alert
+    by_src = ALERT_STATE.get("by_source") or {}
+    by_src[source] = alert
+    ALERT_STATE["by_source"] = by_src
 
 @app.get("/")
 async def root():
@@ -307,6 +345,9 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
     idx = 0
     filename = os.path.basename(path)
     cfg = LOCATION_CONFIGS.get(filename)
+    # alert history window for panic index
+    panic_window = int(CONFIG.get("panic_window", 10) or 10)
+    recent_counts: deque = deque(maxlen=panic_window)
     try:
         while True:
             ret, frame = cap.read()
@@ -353,6 +394,12 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             # Density per megapixel (people/MP)
             area_mp = (w * h) / 1_000_000.0 if w and h else 0.0
             dens = (count / area_mp) if area_mp else 0.0
+            # Compute panic and record alert on threshold or CRITICAL severity
+            panic = _compute_panic_index(recent_counts, count)
+            recent_counts.append(count)
+            if sev['label'] == 'CRITICAL' or dens > (CONFIG.get('density_threshold', 12.0) or 12.0) or panic > (CONFIG.get('panic_threshold', 0.7) or 0.7):
+                _record_alert(filename, count, dens, panic, 'CRITICAL' if sev['label'] == 'CRITICAL' else sev['label'])
+
             label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP"
             # If location config includes true area, show people per m^2
             if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
@@ -456,12 +503,19 @@ async def dashboard():
     </head>
     <body>
       <h2>Crowd Detection - Demo Videos</h2>
+      <div id="alertBox" style="display:none;padding:12px 14px;border-radius:8px;color:#fff;position:fixed;top:16px;right:16px;z-index:1000;box-shadow:0 6px 16px rgba(0,0,0,0.2);"></div>
       <div id="list">Loading...</div>
       <div id="controls">
         <label>Detector: <select id="det"><option value="hog" selected>HOG</option><option value="yolo">YOLOv8</option></select></label>
         <label>Frame stride: <input id="stride" type="number" value="2" min="1" max="10" /></label>
         <button id="start">Start Selected (max 3)</button>
         <button id="stop">Stop All</button>
+        <button id="useLoc">Select Current Location</button>
+        <input id="ulat" type="number" step="any" placeholder="lat" style="width:110px;" />
+        <input id="ulon" type="number" step="any" placeholder="lon" style="width:110px;" />
+        <button id="setLoc">Place User Marker</button>
+        <button id="pickOnMap">Pick on Map</button>
+        <button id="recenter">Recenter</button>
       </div>
       <div class="grid">
         <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
@@ -473,6 +527,8 @@ async def dashboard():
       <div id="map"></div>
       <script>
         let videos = [];
+        let alertHideTimer = null;
+        let perSourcePopupAt = {}; // source -> last popup ms
         async function load() {
           const r = await fetch('/videos/demo');
           const j = await r.json();
@@ -536,9 +592,36 @@ async def dashboard():
           }, 800);
         }
 
+        async function pollAlerts(){
+          try{
+            const r = await fetch('/alerts/by_source');
+            if(!r.ok) return;
+            const j = await r.json();
+            const by = j && j.by_source ? j.by_source : {};
+            const entries = Object.values(by);
+            if(!entries.length) return;
+            const now = Date.now();
+            for(const a of entries){
+              if(!a || (a.severity||'').toUpperCase() !== 'CRITICAL') continue;
+              const src = a.source || 'unknown';
+              const lastAt = perSourcePopupAt[src] || 0;
+              if(now - lastAt < 30000) continue; // 30s cooldown per source
+              const box = document.getElementById('alertBox');
+              box.style.background = '#c62828';
+              box.textContent = `[${a.time}] ${a.severity} @ ${src} — ` + a.message;
+              box.style.display = 'block';
+              if(alertHideTimer) clearTimeout(alertHideTimer);
+              alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 3000);
+              perSourcePopupAt[src] = now;
+              break; // show one at a time
+            }
+          }catch(e){}
+        }
+
         document.getElementById('start').onclick = startSelected;
         document.getElementById('stop').onclick = stopAll;
         load();
+        setInterval(pollAlerts, 2000);
 
         // OSM + OSRM map setup
         const map = L.map('map').setView([20.5937, 78.9629], 5); // India center
@@ -550,6 +633,10 @@ async def dashboard():
         let router = null;
         let selected = [];
         let locationsCache = {};
+        let userMarker = null;
+        let userCircle = null;
+        let pickMode = false;
+        const USER_RADIUS_METERS = 3000; // 3 km radius gate for visibility
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -568,9 +655,29 @@ async def dashboard():
             const r = await fetch('/congestion?include_idle=0');
             const j = await r.json();
             if(!j.items) return;
+            // If user location is not set, hide all markers.
+            if(!userMarker){
+              if(markers.size){
+                markers.forEach(({ marker }) => { map.removeLayer(marker); });
+                markers.clear();
+              }
+              setTimeout(poll, 3000);
+              return;
+            }
+            const u = userMarker.getLatLng();
             j.items.forEach(it => {
               if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
               const key = it.filename;
+              const dist = map.distance(L.latLng(it.lat, it.lon), u);
+              const inRange = dist <= USER_RADIUS_METERS;
+              if(!inRange){
+                if(markers.has(key)){
+                  const { marker } = markers.get(key);
+                  map.removeLayer(marker);
+                  markers.delete(key);
+                }
+                return;
+              }
               const html = `<b>${it.location_id || key}</b><br/>`+
                 `<span class="${sevClass(it.severity)}">${it.severity}</span><br/>`+
                 `Count: ${it.count}<br/>`+
@@ -585,6 +692,17 @@ async def dashboard():
               } else {
                 const marker = L.circleMarker([it.lat, it.lon], { radius, color, fillColor: color, fillOpacity: 0.7, weight: 2 }).addTo(map).bindPopup(html);
                 marker.on('click', () => {
+                  // If user location is known, route from user to this marker.
+                  if(userMarker){
+                    const u = userMarker.getLatLng();
+                    if(router){ map.removeControl(router); router=null; }
+                    router = L.Routing.control({
+                      waypoints: [ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ],
+                      routeWhileDragging: false,
+                    }).addTo(map);
+                    return;
+                  }
+                  // Fallback to original 2-click routing between markers
                   if(selected.length === 2){ selected = []; if(router){ map.removeControl(router); router=null; } }
                   selected.push([it.lat, it.lon]);
                   if(selected.length === 2){
@@ -601,6 +719,69 @@ async def dashboard():
           setTimeout(poll, 3000);
         }
         poll();
+
+        function placeUser(lat, lon, accuracy){
+          const latlng = L.latLng(lat, lon);
+          if(userMarker){ userMarker.setLatLng(latlng); }
+          else {
+            userMarker = L.marker(latlng, { title: 'You are here', draggable: true }).addTo(map).bindPopup('You are here');
+            userMarker.on('dragend', () => {
+              const ll = userMarker.getLatLng();
+              if(userCircle){ userCircle.setLatLng(ll); }
+              document.getElementById('ulat').value = ll.lat.toFixed(6);
+              document.getElementById('ulon').value = ll.lng.toFixed(6);
+            });
+          }
+          if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
+          else { userCircle = L.circle(latlng, { radius: USER_RADIUS_METERS, color: '#1976d2', fillColor: '#64b5f6', fillOpacity: 0.2 }).addTo(map); }
+          map.flyTo(latlng, Math.max(14, map.getZoom()));
+          userMarker.openPopup();
+          // Sync inputs
+          document.getElementById('ulat').value = lat.toFixed(6);
+          document.getElementById('ulon').value = lon.toFixed(6);
+        }
+
+        document.getElementById('useLoc').onclick = async () => {
+          if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+          navigator.geolocation.getCurrentPosition(
+            (pos) => {
+              const { latitude, longitude, accuracy } = pos.coords;
+              placeUser(latitude, longitude, accuracy);
+            },
+            (err) => { alert('Failed to get location: ' + err.message); },
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+          );
+        };
+
+        document.getElementById('setLoc').onclick = () => {
+          const lat = parseFloat(document.getElementById('ulat').value);
+          const lon = parseFloat(document.getElementById('ulon').value);
+          if(Number.isFinite(lat) && Number.isFinite(lon)){
+            placeUser(lat, lon, null);
+          } else {
+            alert('Enter valid lat/lon');
+          }
+        };
+
+        document.getElementById('pickOnMap').onclick = () => {
+          pickMode = !pickMode;
+          document.getElementById('pickOnMap').textContent = pickMode ? 'Picking… (click on map)' : 'Pick on Map';
+        };
+
+        map.on('click', (e) => {
+          if(!pickMode) return;
+          pickMode = false;
+          document.getElementById('pickOnMap').textContent = 'Pick on Map';
+          placeUser(e.latlng.lat, e.latlng.lng, null);
+        });
+
+        document.getElementById('recenter').onclick = () => {
+          if(userMarker){
+            const ll = userMarker.getLatLng();
+            map.flyTo(ll, Math.max(14, map.getZoom()));
+            userMarker.openPopup();
+          }
+        };
       </script>
     </body>
     </html>
@@ -659,6 +840,31 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
             item["density_per_m2"] = round((cnt / area_m2), 3) if area_m2 > 0 else 0.0
         series.append(item)
     return JSONResponse({"filename": filename, "frame_stride": frame_stride, "series": series, "area_mp": round(area_mp, 3) if area_mp else 0.0})
+
+# Alerts API
+@app.get("/alerts/latest")
+async def alerts_latest():
+    return JSONResponse({"latest": ALERT_STATE.get("latest")})
+
+@app.get("/alerts/config")
+async def alerts_get_config():
+    return JSONResponse({"config": CONFIG})
+
+@app.post("/alerts/config")
+async def alerts_set_config(density_threshold: float = None, panic_threshold: float = None, panic_window: int = None, panic_scale: float = None):
+    if density_threshold is not None:
+        CONFIG["density_threshold"] = float(density_threshold)
+    if panic_threshold is not None:
+        CONFIG["panic_threshold"] = float(panic_threshold)
+    if panic_window is not None and int(panic_window) > 0:
+        CONFIG["panic_window"] = int(panic_window)
+    if panic_scale is not None and float(panic_scale) > 0:
+        CONFIG["panic_scale"] = float(panic_scale)
+    return JSONResponse({"config": CONFIG})
+
+@app.get("/alerts/by_source")
+async def alerts_by_source():
+    return JSONResponse({"by_source": ALERT_STATE.get("by_source", {})})
 
 @app.get("/locations")
 async def get_locations():
