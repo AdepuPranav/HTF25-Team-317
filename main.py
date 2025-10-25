@@ -5,12 +5,52 @@ import cv2
 import tempfile
 import os
 from typing import Dict, List
+from collections import deque
+import time
+from datetime import datetime
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception:
     YOLO = None
 
 app = FastAPI(title="Crowd Data Ingestion - Video Uploader")
+
+# --- Decision & Alert System Config and State ---
+# All values are runtime-configurable via /alerts/config
+CONFIG: Dict[str, float] = {
+    "density_threshold": 12.0,  # people per megapixel
+    "panic_threshold": 0.7,     # 0..1
+    "panic_window": 10,         # frames for trend estimation
+    "panic_scale": 8.0          # normalization for change magnitude
+}
+
+ALERT_STATE: Dict[str, object] = {
+    "latest": None  # type: ignore
+}
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def _compute_panic_index(history: deque, current_count: int) -> float:
+    # Simple trend-based panic score in [0,1]
+    # Based on absolute difference between current and mean of history, normalized
+    if not history:
+        return 0.0
+    avg = sum(history) / len(history)
+    diff = abs(current_count - avg)
+    scale = CONFIG.get("panic_scale", 8.0) or 1.0
+    return max(0.0, min(1.0, diff / scale))
+
+def _record_alert(source: str, count: int, density_per_mp: float, panic_index: float, severity: str):
+    ALERT_STATE["latest"] = {
+        "time": _now_iso(),
+        "source": source,
+        "count": int(count),
+        "density_per_mp": round(density_per_mp, 3),
+        "panic_index": round(panic_index, 3),
+        "severity": severity,
+        "message": f"{severity}: density={density_per_mp:.2f}/MP, panic={panic_index:.2f}, count={count}"
+    }
 
 @app.get("/")
 async def root():
@@ -241,7 +281,16 @@ def _severity_for_count(count: int) -> Dict[str, object]:
         return {"label": "MODERATE", "color": (0, 215, 255)}  # yellow-ish (BGR)
     return {"label": "CRITICAL", "color": (0, 0, 255)}
 
-def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog'):
+def _severity_for_density(density_per_mp: float) -> str:
+    thr = CONFIG.get("density_threshold", 12.0)
+    # Map to same labels roughly
+    if density_per_mp <= max(3.0, 0.3 * thr):
+        return "SAFE"
+    if density_per_mp <= thr:
+        return "MODERATE"
+    return "CRITICAL"
+
+def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, detector: str = 'hog', source_label: str = "stream"):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         yield b""
@@ -249,6 +298,8 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
     hog = _hog_detector() if detector != 'yolo' else None
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     idx = 0
+    panic_window = int(CONFIG.get("panic_window", 10) or 10)
+    recent_counts: deque = deque(maxlen=panic_window)
     try:
         while True:
             ret, frame = cap.read()
@@ -282,7 +333,17 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             # Density per megapixel (people/MP)
             area_mp = (w * h) / 1_000_000.0 if w and h else 0.0
             dens = (count / area_mp) if area_mp else 0.0
-            label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP"
+
+            # Compute panic index and trigger alerts if thresholds exceeded
+            panic = _compute_panic_index(recent_counts, count)
+            recent_counts.append(count)
+            density_thr = CONFIG.get("density_threshold", 12.0)
+            panic_thr = CONFIG.get("panic_threshold", 0.7)
+            if (dens > density_thr) or (panic > panic_thr):
+                sev_label = _severity_for_density(dens)
+                _record_alert(source_label, count, dens, panic, sev_label)
+
+            label = f"{sev['label']} | Count: {count} | Dens: {dens:.2f}/MP | Panic: {panic:.2f}"
             cv2.putText(frame, label, (10, int(banner_h * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             # Optional timestamp/second estimate
             if fps and fps > 0:
@@ -310,7 +371,7 @@ async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str 
         raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
     if detector == 'yolo' and YOLO is None:
         raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
-    gen = _stream_overlay(path, frame_stride=frame_stride, detector=detector)
+    gen = _stream_overlay(path, frame_stride=frame_stride, detector=detector, source_label=filename)
     return StreamingResponse(gen, media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/dashboard")
@@ -331,16 +392,33 @@ async def dashboard():
         .panel { border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
         .panel h4 { margin: 4px 0; font-size: 14px; }
         img { width: 100%; border-radius: 6px; }
+        #alertBox { display:none; padding:12px 14px; border-radius:8px; color:#fff; position:fixed; top:16px; right:16px; z-index:1000; box-shadow:0 6px 16px rgba(0,0,0,0.2); }
+        #alertBox.safe { background:#2e7d32; }
+        #alertBox.moderate { background:#f9a825; }
+        #alertBox.critical { background:#c62828; }
+        #cfg { margin: 14px 0; padding:10px; border:1px solid #eee; border-radius:8px; }
+        #cfg label { margin-right: 10px; }
       </style>
     </head>
     <body>
       <h2>Crowd Detection - Demo Videos</h2>
+      <div id=\"alertBox\"></div>
       <div id=\"list\">Loading...</div>
       <div id=\"controls\">
         <label>Detector: <select id=\"det\"><option value=\"hog\" selected>HOG</option><option value=\"yolo\">YOLOv8</option></select></label>
         <label>Frame stride: <input id=\"stride\" type=\"number\" value=\"2\" min=\"1\" max=\"10\" /></label>
         <button id=\"start\">Start Selected (max 3)</button>
         <button id=\"stop\">Stop All</button>
+      </div>
+      <div id=\"cfg\">
+        <strong>Alerts Config</strong>
+        <div style=\"margin-top:8px\">
+          <label>Density thr: <input id=\"cfg_density\" type=\"number\" step=\"0.1\"/></label>
+          <label>Panic thr: <input id=\"cfg_panic\" type=\"number\" step=\"0.05\" min=\"0\" max=\"1\"/></label>
+          <label>Panic window: <input id=\"cfg_window\" type=\"number\" min=\"3\" max=\"60\"/></label>
+          <label>Panic scale: <input id=\"cfg_scale\" type=\"number\" step=\"0.1\" min=\"1\"/></label>
+          <button id=\"cfg_save\">Save</button>
+        </div>
       </div>
       <div class=\"grid\">
         <div class=\"panel\"><h4 id=\"t1\">Panel 1</h4><img id=\"p1\" src=\"\" alt=\"panel1\" /></div>
@@ -349,6 +427,8 @@ async def dashboard():
       </div>
       <script>
         let videos = [];
+        let lastAlertTime = null;
+        let alertHideTimer = null;
         async function load() {
           const r = await fetch('/videos/demo');
           const j = await r.json();
@@ -364,6 +444,31 @@ async def dashboard():
             row.appendChild(cb); row.appendChild(lab);
             list.appendChild(row);
           });
+        }
+
+        async function loadConfig(){
+          try{
+            const r = await fetch('/alerts/config');
+            const j = await r.json();
+            const c = j.config || {};
+            document.getElementById('cfg_density').value = c.density_threshold ?? '';
+            document.getElementById('cfg_panic').value = c.panic_threshold ?? '';
+            document.getElementById('cfg_window').value = c.panic_window ?? '';
+            document.getElementById('cfg_scale').value = c.panic_scale ?? '';
+          }catch(e){}
+        }
+
+        async function saveConfig(){
+          const params = new URLSearchParams();
+          const d = document.getElementById('cfg_density').value;
+          const p = document.getElementById('cfg_panic').value;
+          const w = document.getElementById('cfg_window').value;
+          const s = document.getElementById('cfg_scale').value;
+          if(d) params.append('density_threshold', d);
+          if(p) params.append('panic_threshold', p);
+          if(w) params.append('panic_window', w);
+          if(s) params.append('panic_scale', s);
+          await fetch('/alerts/config?' + params.toString(), { method: 'POST' });
         }
 
         function stopAll() {
@@ -384,9 +489,31 @@ async def dashboard():
           });
         }
 
+        async function pollAlerts(){
+          try{
+            const r = await fetch('/alerts/latest');
+            if(!r.ok) return;
+            const j = await r.json();
+            if(!j || !j.latest) return;
+            if(lastAlertTime === j.latest.time) return;
+            lastAlertTime = j.latest.time;
+            const box = document.getElementById('alertBox');
+            const sev = (j.latest.severity || 'SAFE').toLowerCase();
+            box.className = '';
+            box.classList.add(sev === 'critical' ? 'critical' : (sev === 'moderate' ? 'moderate' : 'safe'));
+            box.textContent = `[${j.latest.time}] ${j.latest.severity} @ ${j.latest.source} — ` + j.latest.message;
+            box.style.display = 'block';
+            if(alertHideTimer) clearTimeout(alertHideTimer);
+            alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 8000);
+          }catch(e){ /* ignore */ }
+        }
+
         document.getElementById('start').onclick = startSelected;
         document.getElementById('stop').onclick = stopAll;
+        document.getElementById('cfg_save').onclick = saveConfig;
         load();
+        loadConfig();
+        setInterval(pollAlerts, 2000);
       </script>
     </body>
     </html>
@@ -409,6 +536,9 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
     hog = _hog_detector() if detector != 'yolo' else None
     idx = 0
     per_sec: Dict[int, int] = {}
+    # for panic estimation per second
+    window = int(CONFIG.get("panic_window", 10) or 10)
+    recent_counts: deque = deque(maxlen=window)
     try:
         while True:
             ret, frame = cap.read()
@@ -424,6 +554,7 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
             count = len(rects) if rects else 0
             sec = int(idx / fps) if fps and fps > 0 else 0
             per_sec[sec] = per_sec.get(sec, 0) + count
+            recent_counts.append(count)
             idx += 1
     finally:
         cap.release()
@@ -439,7 +570,36 @@ async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str
         cnt = per_sec[s]
         dens = (cnt / area_mp) if area_mp else 0.0
         series.append({"second": s, "count": cnt, "density_per_mp": round(dens, 3)})
+    # Basic alert check on aggregate (max density over seconds)
+    if series:
+        max_dens = max(p["density_per_mp"] for p in series)
+        avg_cnt = sum(p["count"] for p in series) / max(1, len(series))
+        panic = _compute_panic_index(recent_counts, int(avg_cnt))
+        if (max_dens > CONFIG.get("density_threshold", 12.0)) or (panic > CONFIG.get("panic_threshold", 0.7)):
+            sev = _severity_for_density(max_dens)
+            _record_alert(filename, int(avg_cnt), float(max_dens), float(panic), sev)
     return JSONResponse({"filename": filename, "frame_stride": frame_stride, "series": series, "area_mp": round(area_mp, 3) if area_mp else 0.0})
+
+# --- Alerts API ---
+@app.get("/alerts/latest")
+async def alerts_latest():
+    return JSONResponse({"latest": ALERT_STATE.get("latest")})
+
+@app.get("/alerts/config")
+async def alerts_get_config():
+    return JSONResponse({"config": CONFIG})
+
+@app.post("/alerts/config")
+async def alerts_set_config(density_threshold: float = None, panic_threshold: float = None, panic_window: int = None, panic_scale: float = None):
+    if density_threshold is not None:
+        CONFIG["density_threshold"] = float(density_threshold)
+    if panic_threshold is not None:
+        CONFIG["panic_threshold"] = float(panic_threshold)
+    if panic_window is not None and int(panic_window) > 0:
+        CONFIG["panic_window"] = int(panic_window)
+    if panic_scale is not None and float(panic_scale) > 0:
+        CONFIG["panic_scale"] = float(panic_scale)
+    return JSONResponse({"config": CONFIG})
 
 if __name__ == "__main__":
     # For local testing: python main.py
