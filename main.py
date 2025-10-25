@@ -5,7 +5,8 @@ import cv2
 import tempfile
 import os
 import time
-from typing import Dict, List
+import asyncio
+from typing import Dict, List, Optional
 from collections import deque
 from datetime import datetime
 try:
@@ -13,19 +14,30 @@ try:
 except Exception:
     YOLO = None
 
+# Azure integrations (minimal, optional)
+try:
+    from azure_integrations import (
+        blob_enabled,
+        blob_upload_bytes,
+        blob_list_videos,
+        resolve_path_for_processing,
+        sb_enabled,
+        sb_send_json,
+    )
+except Exception:
+    blob_enabled = lambda: False
+    blob_upload_bytes = None
+    blob_list_videos = lambda: []
+    resolve_path_for_processing = None
+    sb_enabled = lambda: False
+    sb_send_json = None
+
 from fastapi import FastAPI
-app = FastAPI()
+app = FastAPI(title="Crowd Data Ingestion - Video Uploader")
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
-
-@app.get("/dashboard")
-def dashboard():
-    return "<h1>Dashboard works 🎯</h1>"
-
-
-app = FastAPI(title="Crowd Data Ingestion - Video Uploader")
+async def root():
+    return {"status": "ok", "service": "video-uploader"}
 
 # In-memory location configs keyed by filename.
 # Each config: {"location_id": str, "area_m2": float, "roi": List[[x,y], ...], "lat": float, "lon": float}
@@ -132,6 +144,27 @@ async def analyze_video(file: UploadFile = File(...)):
             "duration_seconds": round(duration, 3) if duration else None,
         }
     )
+
+@app.post("/video/upload")
+async def upload_to_blob(file: UploadFile = File(...)):
+    """Upload video to Azure Blob Storage if configured."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    if not blob_enabled():
+        raise HTTPException(status_code=500, detail="Blob storage not configured")
+    try:
+        size = 0
+        chunks = []
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        blob_upload_bytes(file.filename, b"".join(chunks), overwrite=True)
+        return JSONResponse({"ok": True, "blob": file.filename, "size": size})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to blob: {e}")
 
 def _list_demo_videos() -> List[Dict[str, object]]:
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -273,9 +306,19 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
 
 @app.get("/videos/demo")
 async def list_demo_videos():
-    items = _list_demo_videos()
+    """List videos from Azure Blob Storage (primary) or local directory (fallback)."""
+    items = []
+    # Try Blob Storage first
+    if blob_enabled():
+        try:
+            items = blob_list_videos()
+        except Exception:
+            pass
+    # Fallback to local if no blobs found
     if not items:
-        return JSONResponse({"videos": [], "message": "No non-empty demo videos found in current directory."})
+        items = _list_demo_videos()
+    if not items:
+        return JSONResponse({"videos": [], "message": "No videos found in blob storage or local directory."})
     # Auto-geotag first two non-empty videos if not present
     try:
         if len(items) >= 1:
@@ -300,11 +343,62 @@ async def list_demo_videos():
         pass
     return JSONResponse({"videos": items})
 
-import numpy as np
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+@app.get("/videos/source")
+async def list_all_sources():
+    """List both local and blob videos for unified access."""
+    local = _list_demo_videos()
+    blobs = []
+    try:
+        if blob_enabled():
+            blobs = blob_list_videos()
+    except Exception:
+        pass
+    try:
+        spots = [
+            (17.3850, 78.4867, "Charminar"),
+            (17.4435, 78.3772, "HITEC City"),
+            (17.4399, 78.4983, "Secunderabad Junction"),
+            (17.4156, 78.4747, "Tank Bund"),
+            (17.4566, 78.5010, "Begumpet"),
+            (17.4933, 78.3996, "KPHB"),
+            (17.3566, 78.5570, "LB Nagar"),
+        ]
+        # Build a set of already-used coords to avoid duplicates
+        used = set()
+        for v in LOCATION_CONFIGS.values():
+            try:
+                la = v.get("lat"); lo = v.get("lon")
+                if isinstance(la, (int, float)) and isinstance(lo, (int, float)):
+                    used.add((float(la), float(lo)))
+            except Exception:
+                pass
+        for i, b in enumerate(blobs or []):
+            fname = b.get("filename") if isinstance(b, dict) else None
+            if not fname:
+                continue
+            if fname not in LOCATION_CONFIGS:
+                # Pick the first unused spot; if all used, fall back to index
+                pick = None
+                for s in spots:
+                    if (float(s[0]), float(s[1])) not in used:
+                        pick = s
+                        break
+                if pick is None:
+                    pick = spots[i % len(spots)]
+                lat, lon, lid = pick
+                LOCATION_CONFIGS[fname] = {
+                    "location_id": lid,
+                    "area_m2": 1000.0,
+                    "roi": [],
+                    "lat": float(lat),
+                    "lon": float(lon),
+                }
+                used.add((float(lat), float(lon)))
+    except Exception:
+        pass
+    return JSONResponse({"local": local, "blob": blobs})
 
-app = FastAPI()
+import numpy as np
 
 # Example demo endpoint with predictive analysis
 @app.post("/videos/analyze/demo")
@@ -373,9 +467,30 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
     idx = 0
     filename = os.path.basename(path)
     cfg = LOCATION_CONFIGS.get(filename)
+    if not cfg:
+        spots = [
+            (17.3850, 78.4867, "Charminar"),
+            (17.4435, 78.3772, "HITEC City"),
+            (17.4399, 78.4983, "Secunderabad Junction"),
+            (17.4156, 78.4747, "Tank Bund"),
+            (17.4566, 78.5010, "Begumpet"),
+            (17.4933, 78.3996, "KPHB"),
+            (17.3566, 78.5570, "LB Nagar"),
+        ]
+        idx = abs(hash(filename)) % len(spots)
+        lat, lon, lid = spots[idx]
+        cfg = {
+            "location_id": lid,
+            "area_m2": 1000.0,
+            "roi": [],
+            "lat": float(lat),
+            "lon": float(lon),
+        }
+        LOCATION_CONFIGS[filename] = cfg
     # alert history window for panic index
     panic_window = int(CONFIG.get("panic_window", 10) or 10)
     recent_counts: deque = deque(maxlen=panic_window)
+    logged_once = False
     try:
         while True:
             ret, frame = cap.read()
@@ -462,6 +577,12 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             loc_id = cfg.get("location_id") if cfg else filename
             lat = cfg.get("lat") if cfg else None
             lon = cfg.get("lon") if cfg else None
+            if not logged_once:
+                try:
+                    print(f"[STREAM] {filename} placed at location_id='{loc_id}', lat={lat}, lon={lon}")
+                except Exception:
+                    pass
+                logged_once = True
             payload = {
                 "ts": int(time.time()),
                 "filename": filename,
@@ -491,6 +612,12 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
 @app.get("/videos/stream")
 async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str = 'hog'):
     items = _list_demo_videos()
+    # Also check blob videos if enabled
+    if blob_enabled():
+        try:
+            items += blob_list_videos()
+        except Exception:
+            pass
     if not any(it["filename"] == filename for it in items):
         raise HTTPException(status_code=404, detail="Requested filename not found or empty")
     path = next(it["path"] for it in items if it["filename"] == filename)
@@ -498,8 +625,19 @@ async def stream_demo_video(filename: str, frame_stride: int = 2, detector: str 
         raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
     if detector == 'yolo' and YOLO is None:
         raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
-    gen = _stream_overlay(path, frame_stride=frame_stride, detector=detector)
-    return StreamingResponse(gen, media_type="multipart/x-mixed-replace; boundary=frame")
+    # Resolve blob:// paths to temp files; cleanup after streaming
+    proc_path, cleanup = resolve_path_for_processing(path) if resolve_path_for_processing else (path, lambda: None)
+    def _gen():
+        try:
+            gen = _stream_overlay(proc_path, frame_stride=frame_stride, detector=detector)
+            for chunk in gen:
+                yield chunk
+        finally:
+            try:
+                cleanup()
+            except Exception:
+                pass
+    return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/dashboard")
 async def dashboard():
@@ -1029,33 +1167,6 @@ def dashboard():
     return HTMLResponse(html)
 
 
-if __name__ == "__main__":
-    # For local testing: python main.py
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-from fastapi import FastAPI
-from datetime import datetime
-
-app = FastAPI()
-
-@app.get("/alerts/latest")
-def latest_alert():
-    return {
-        "latest": {
-            "time": datetime.now().isoformat(),
-            "severity": "SAFE",
-            "source": "system",
-            "message": "No alerts detected."
-        }
-    }
-
-
-from fastapi import FastAPI, Request
-from typing import Optional
-
-app = FastAPI()
-
 config = {
     "density_threshold": 10,
     "panic_threshold": 0.5,
@@ -1133,3 +1244,7 @@ def get_congestion(include_idle: int = 0):
         })
 
     return JSONResponse({"zones": data})
+
+if __name__ == "__main__":
+    # For local testing: python main.py
+    uvicorn.run(app, host="0.0.0.0", port=8000)
