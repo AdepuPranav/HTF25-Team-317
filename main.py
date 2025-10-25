@@ -262,32 +262,48 @@ async def list_demo_videos():
         pass
     return JSONResponse({"videos": items})
 
+import numpy as np
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+# Example demo endpoint with predictive analysis
 @app.post("/videos/analyze/demo")
-async def analyze_demo_videos(filename: str = None, frame_stride: int = 5, detector: str = 'hog'):
-    items = _list_demo_videos()
-    if not items:
-        raise HTTPException(status_code=400, detail="No demo videos found")
-    targets: List[Dict[str, object]]
-    if filename:
-        targets = [it for it in items if it["filename"] == filename]
-        if not targets:
-            raise HTTPException(status_code=404, detail="Requested filename not found or empty")
-    else:
-        targets = items
-    if detector not in {"hog", "yolo"}:
-        raise HTTPException(status_code=400, detail="detector must be 'hog' or 'yolo'")
-    if detector == 'yolo' and YOLO is None:
-        raise HTTPException(status_code=500, detail="YOLO not available. Install ultralytics.")
-    results: List[Dict[str, object]] = []
-    for it in targets:
-        try:
-            res = _analyze_video_file(it["path"], frame_stride=frame_stride, detector=detector)
-        except HTTPException as e:
-            raise e
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed analyzing {it['filename']}: {e}")
-        results.append(res)
-    return JSONResponse({"results": results})
+def analyze_demo_videos(predict_horizon_sec: int = 30):
+    # Example: simulated time series for crowd density
+    past_density = np.array([8.0, 10.5, 12.3, 14.0, 15.5, 17.2])
+
+    # Simple linear prediction using least squares (you can replace with ML model later)
+    x = np.arange(len(past_density))
+    coeffs = np.polyfit(x, past_density, 1)  # linear fit
+    future_x = np.arange(len(past_density), len(past_density) + predict_horizon_sec // 5)
+    predicted_density = np.polyval(coeffs, future_x)
+
+    # Define risk levels
+    alerts = []
+    for i, val in enumerate(predicted_density):
+        if val > 15:
+            alerts.append({
+                "time": int(i * 5),
+                "predicted_density": round(float(val), 2),
+                "risk_level": "⚠️ HIGH",
+                "message": "High crowd density predicted — potential congestion ahead"
+            })
+        else:
+            alerts.append({
+                "time": int(i * 5),
+                "predicted_density": round(float(val), 2),
+                "risk_level": "🟢 Normal",
+                "message": "Crowd stable"
+            })
+
+    return JSONResponse({
+        "historical_density": past_density.tolist(),
+        "predicted_density": predicted_density.tolist(),
+        "alerts": alerts
+    })
+
 
 def _severity_for_count(count: int) -> Dict[str, object]:
     if count <= 3:
@@ -744,21 +760,51 @@ from fastapi.responses import HTMLResponse
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html_content = """
+    html = """
     <html>
-        <head>
-            <title>Crowd Safety Dashboard</title>
-        </head>
-        <body style="font-family: sans-serif; background: #f5f5f5;">
-            <h1>🎥 Crowd Safety Intelligence Dashboard</h1>
-            <p>✅ Live video overlay stream: <a href="/videos/stream" target="_blank">View Stream</a></p>
-            <p>⚙️ Analyze demo videos: <a href="/videos/analyze/demo" target="_blank">Run Analysis</a></p>
-            <p>📊 Latest Alerts: <a href="/alerts/latest" target="_blank">Check Alerts</a></p>
-            <p>🌍 Congestion Map Data: <a href="/congestion" target="_blank">View Congestion Data</a></p>
-        </body>
+    <head>
+        <title>Crowd Safety Dashboard</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body style="font-family:sans-serif; background:#f7f7f7; text-align:center;">
+        <h1>🎥 Crowd Safety Intelligence Dashboard</h1>
+        <button onclick="analyze()">🔮 Run Predictive Analysis</button>
+        <canvas id="densityChart" width="600" height="300"></canvas>
+        <div id="alerts"></div>
+
+        <script>
+        async function analyze() {
+            const res = await fetch('/videos/analyze/demo', { method: 'POST' });
+            const data = await res.json();
+
+            const ctx = document.getElementById('densityChart').getContext('2d');
+            const labels = [...Array(data.historical_density.length + data.predicted_density.length).keys()].map(i => i*5);
+            const densities = [...data.historical_density, ...data.predicted_density];
+
+            new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: 'Crowd Density (past + predicted)',
+                        data: densities,
+                        borderColor: 'red',
+                        borderWidth: 2,
+                        fill: false
+                    }]
+                },
+                options: { scales: { y: { beginAtZero: true } } }
+            });
+
+            const alertDiv = document.getElementById('alerts');
+            alertDiv.innerHTML = "<h3>🔔 Predicted Alerts</h3>" + data.alerts.map(a =>
+                `<p>${a.time}s — ${a.risk_level}: ${a.message}</p>`).join('');
+        }
+        </script>
+    </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
+    return HTMLResponse(html)
 
 
 if __name__ == "__main__":
@@ -836,3 +882,32 @@ def latest_alert():
     }
 
 
+
+
+from fastapi.responses import JSONResponse
+import random
+
+@app.get("/congestion")
+def get_congestion(include_idle: int = 0):
+    """
+    Returns simulated crowd congestion data for dashboard map.
+    Now includes predicted density (`pred_density_mp`) for each zone.
+    """
+    areas = ["Gate A", "Stage Front", "Corridor 3", "Exit Zone"]
+    data = []
+    for area in areas:
+        curr_density = round(random.uniform(5, 20), 2)
+        pred_density = round(curr_density + random.uniform(-2, 4), 2)
+        severity = (
+            "critical" if pred_density > 18 else
+            "moderate" if pred_density > 12 else
+            "safe"
+        )
+        data.append({
+            "area": area,
+            "density_now": curr_density,
+            "pred_density_mp": pred_density,
+            "severity": severity
+        })
+
+    return JSONResponse({"zones": data})

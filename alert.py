@@ -28,7 +28,8 @@ CONFIG: Dict[str, float] = {
     "predict_alert_enabled": 1.0,
     "alert_cooldown_sec": 15.0,
     "ema_alpha": 0.2,
-    "z_threshold": 2.5
+    "z_threshold": 2.5,
+    "history_maxlen_sec": 180.0
 }
 
 ALERT_STATE: Dict[str, object] = {
@@ -68,6 +69,34 @@ LOCATION_CONFIGS: Dict[str, Dict[str, object]] = {}
 GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
 
 LAST_ALERT_TS: Dict[str, int] = {}
+
+# Per-stream history for predictive analytics (per second)
+# STREAM_HISTORY[filename] = deque of {"ts","second","count","density_mp","panic"}
+from collections import deque
+STREAM_HISTORY: Dict[str, deque] = {}
+
+def _append_history(name: str, item: Dict[str, object]):
+    maxlen = int(CONFIG.get("history_maxlen_sec", 180) or 180)
+    dq = STREAM_HISTORY.get(name)
+    if dq is None:
+        dq = deque(maxlen=maxlen)
+        STREAM_HISTORY[name] = dq
+    dq.append(item)
+
+def _linear_forecast(y: List[float], horizon: int) -> List[float]:
+    n = len(y)
+    if n < 3:
+        return [y[-1] if y else 0.0] * max(0, horizon)
+    s_t = (n - 1) * n / 2.0
+    s_tt = (n - 1) * n * (2 * n - 1) / 6.0
+    s_y = sum(y)
+    s_ty = sum(y[i] * i for i in range(n))
+    denom = n * s_tt - s_t * s_t
+    if denom == 0:
+        return [y[-1]] * horizon
+    a = (n * s_ty - s_t * s_y) / denom
+    b = (s_y / n) - a * (s_t / n)
+    return [max(0.0, a * ((n - 1) + k) + b) for k in range(1, horizon + 1)]
 
 @app.get("/")
 async def root():
@@ -443,7 +472,19 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
             if last_sec is None:
                 last_sec = sec
             elif sec != last_sec:
-                recent_sec_counts.append(counts_per_sec.get(last_sec, 0))
+                # finalize previous second aggregation
+                sec_count = counts_per_sec.get(last_sec, 0)
+                recent_sec_counts.append(sec_count)
+                # compute densities for history entry using current frame size as proxy
+                area_mp_hist = (w * h) / 1_000_000.0 if w and h else 0.0
+                dens_hist = (sec_count / area_mp_hist) if area_mp_hist else 0.0
+                _append_history(filename, {
+                    "ts": int(time.time()),
+                    "second": int(last_sec),
+                    "count": int(sec_count),
+                    "density_mp": float(dens_hist),
+                    "panic": float(panic)
+                })
                 last_sec = sec
 
             if ema_count is None:
@@ -586,6 +627,7 @@ async def dashboard():
         .sev-safe { color: #1a7f37; }
         .sev-moderate { color: #b58900; }
         .sev-critical { color: #d73a49; }
+        .pred-warn { color: #b58900; font-weight: 600; }
       </style>
       <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
       <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -616,6 +658,13 @@ async def dashboard():
         <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
         <div class="panel"><h4 id="t2">Panel 2</h4><img id="p2" src="" alt="panel2" /></div>
         <div class="panel"><h4 id="t3">Panel 3</h4><img id="p3" src="" alt="panel3" /></div>
+      </div>
+
+      <h3>Near-term Forecasts</h3>
+      <div class="grid" id="chartGrid">
+        <div class="panel"><div id="sum1" class="sum"></div></div>
+        <div class="panel"><div id="sum2" class="sum"></div></div>
+        <div class="panel"><div id="sum3" class="sum"></div></div>
       </div>
 
       <h3>Live Congestion Map (OSM + OSRM)</h3>
@@ -655,6 +704,7 @@ async def dashboard():
             document.getElementById('cfg_panic').value = c.panic_threshold ?? '';
             document.getElementById('cfg_window').value = c.panic_window ?? '';
             document.getElementById('cfg_scale').value = c.panic_scale ?? '';
+            if(typeof c.density_threshold === 'number') densityThreshold = c.density_threshold;
           }catch(e){}
         }
 
@@ -674,6 +724,8 @@ async def dashboard():
         function stopAll() {
           ['p1','p2','p3'].forEach(id => { document.getElementById(id).src = ''; });
           ['t1','t2','t3'].forEach(id => { document.getElementById(id).textContent = 'Panel'; });
+          panelMap.clear();
+          sumMap.clear();
         }
 
         function startSelected() {
@@ -686,6 +738,9 @@ async def dashboard():
             const [imgId, tId] = panels[idx];
             document.getElementById(imgId).src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s + '&detector=' + det;
             document.getElementById(tId).textContent = c.value;
+            panelMap.set(c.value, tId);
+            const sumId = panelOrder[idx][1];
+            sumMap.set(c.value, sumId);
           });
 
           // Pan map to selected locations and open popups once markers are ready
@@ -748,6 +803,10 @@ async def dashboard():
         let router = null;
         let selected = [];
         let locationsCache = {};
+        let panelMap = new Map(); // filename -> title element id
+        let densityThreshold = 12.0;
+        const panelOrder = [ ['t1','sum1'], ['t2','sum2'], ['t3','sum3'] ];
+        let sumMap = new Map();   // filename -> summary element id
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -794,16 +853,111 @@ async def dashboard():
                 });
                 markers.set(key, { marker });
               }
+
+              // Update panel titles with predictive density when available
+              if(panelMap.has(key)){
+                const tId = panelMap.get(key);
+                const el = document.getElementById(tId);
+                if(el){
+                  if(typeof it.pred_density_mp === 'number'){
+                    const pred = Number(it.pred_density_mp).toFixed(2);
+                    const warn = (typeof densityThreshold === 'number') && (Number(it.pred_density_mp) > densityThreshold);
+                    el.innerHTML = `${key} <span class="${warn ? 'pred-warn' : ''}">[Pred: ${pred}/MP]</span>`;
+                  } else {
+                    el.textContent = key;
+                  }
+                }
+              }
             });
           }catch(e){/* ignore */}
           setTimeout(poll, 3000);
         }
         poll();
+
+        async function pollPredict(){
+          try{
+            const pr = await fetch('/predict');
+            const pj = await pr.json();
+            if(!pj.items) return;
+            pj.items.forEach(it => {
+              const name = it.filename;
+              // Update natural-language summary if present
+              if(sumMap.has(name) && it.summary){
+                const el = document.getElementById(sumMap.get(name));
+                if(el){
+                  const d = it.summary.density || '';
+                  const p = it.summary.panic || '';
+                  el.textContent = `${d}  |  ${p}`;
+                }
+              }
+            });
+          } catch(e) { /* ignore */ }
+          setTimeout(pollPredict, 2000);
+        }
+        pollPredict();
       </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html)
+
+@app.get("/predict")
+async def predict(filename: str | None = None, horizon: int | None = None, window: int | None = None):
+    h = int(horizon or CONFIG.get("predict_horizon_sec", 10) or 10)
+    w = int(window or CONFIG.get("predict_window_sec", 30) or 30)
+    targets = [filename] if filename else list(STREAM_HISTORY.keys())
+    items = []
+    for name in targets:
+        hist = STREAM_HISTORY.get(name)
+        if not hist:
+            continue
+        # take last w entries
+        data = list(hist)[-w:]
+        secs = [int(d.get("second", 0)) for d in data]
+        dens = [float(d.get("density_mp", 0.0)) for d in data]
+        panic_vals = [float(d.get("panic", 0.0)) for d in data]
+        dens_fc = _linear_forecast(dens, h)
+        panic_fc = _linear_forecast(panic_vals, h)
+        last_sec = secs[-1] if secs else 0
+        fut_secs = [int(last_sec + k) for k in range(1, h + 1)]
+        # Build human-readable summaries
+        now_d = dens[-1] if dens else 0.0
+        fut_d = dens_fc[-1] if dens_fc else now_d
+        now_p = panic_vals[-1] if panic_vals else 0.0
+        fut_p = panic_fc[-1] if panic_fc else now_p
+        def p_label(x: float) -> str:
+            if x < 0.3: return "low"
+            if x < 0.6: return "moderate"
+            return "high"
+        density_summary = f"Right now, density = {now_d:.2f}/MP, predicted in {h} sec = {fut_d:.2f}/MP"
+        # Panic narrative
+        now_lbl, fut_lbl = p_label(now_p), p_label(fut_p)
+        if now_lbl == "low" and fut_lbl in {"moderate", "high"}:
+            panic_summary = "Panic level is low now, predicted to spike soon"
+        elif now_lbl == "moderate" and fut_lbl == "high":
+            panic_summary = "Panic is moderate now, likely to rise to high"
+        elif now_lbl == "high" and fut_lbl in {"moderate", "low"}:
+            panic_summary = "Panic is high now, expected to ease"
+        else:
+            panic_summary = f"Panic is {now_lbl} now, expected to stay {fut_lbl}"
+        items.append({
+            "filename": name,
+            "history": {
+                "second": secs,
+                "density_mp": [round(x, 3) for x in dens],
+                "panic": [round(x, 3) for x in panic_vals]
+            },
+            "forecast": {
+                "second": fut_secs,
+                "density_mp_hat": [round(x, 3) for x in dens_fc],
+                "panic_hat": [round(x, 3) for x in panic_fc]
+            },
+            "summary": {
+                "density": density_summary,
+                "panic": panic_summary
+            }
+        })
+    return JSONResponse({"items": items, "horizon": h, "window": w})
 
 @app.post("/videos/analyze/seconds")
 async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str = 'hog'):
