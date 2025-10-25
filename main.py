@@ -523,9 +523,8 @@ async def dashboard():
         <button id="start">Start Selected (max 3)</button>
         <button id="stop">Stop All</button>
         <button id="useLoc">Select Current Location</button>
-        <input id="ulat" type="number" step="any" placeholder="lat" style="width:110px;" />
-        <input id="ulon" type="number" step="any" placeholder="lon" style="width:110px;" />
-        <button id="setLoc">Place User Marker</button>
+        <input id="uloc" type="text" placeholder="Enter location (e.g., Secunderabad Station)" style="width:280px;" />
+        <button id="geocode">Locate</button>
         <button id="pickOnMap">Pick on Map</button>
         <button id="recenter">Recenter</button>
       </div>
@@ -612,10 +611,17 @@ async def dashboard():
             const by = j && j.by_source ? j.by_source : {};
             const entries = Object.values(by);
             if(!entries.length) return;
+            if(!userMarker) return; // No user location -> suppress alerts
+            const u = userMarker.getLatLng();
             const now = Date.now();
             for(const a of entries){
               if(!a || (a.severity||'').toUpperCase() !== 'CRITICAL') continue;
               const src = a.source || 'unknown';
+              // Require a visible marker in range
+              if(!markers.has(src)) continue;
+              const m = markers.get(src).marker;
+              const dist = map.distance(m.getLatLng(), u);
+              if(dist > USER_RADIUS_METERS) continue;
               const lastAt = perSourcePopupAt[src] || 0;
               if(now - lastAt < 30000) continue; // 30s cooldown per source
               const box = document.getElementById('alertBox');
@@ -740,17 +746,17 @@ async def dashboard():
             userMarker.on('dragend', () => {
               const ll = userMarker.getLatLng();
               if(userCircle){ userCircle.setLatLng(ll); }
-              document.getElementById('ulat').value = ll.lat.toFixed(6);
-              document.getElementById('ulon').value = ll.lng.toFixed(6);
+              const tf = document.getElementById('uloc');
+              if(tf) tf.value = `${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}`;
             });
           }
           if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
           else { userCircle = L.circle(latlng, { radius: USER_RADIUS_METERS, color: '#1976d2', fillColor: '#64b5f6', fillOpacity: 0.2 }).addTo(map); }
           map.flyTo(latlng, Math.max(14, map.getZoom()));
           userMarker.openPopup();
-          // Sync inputs
-          document.getElementById('ulat').value = lat.toFixed(6);
-          document.getElementById('ulon').value = lon.toFixed(6);
+          // Sync text field
+          const tf = document.getElementById('uloc');
+          if(tf) tf.value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
         }
 
         document.getElementById('useLoc').onclick = async () => {
@@ -765,15 +771,25 @@ async def dashboard():
           );
         };
 
-        document.getElementById('setLoc').onclick = () => {
-          const lat = parseFloat(document.getElementById('ulat').value);
-          const lon = parseFloat(document.getElementById('ulon').value);
-          if(Number.isFinite(lat) && Number.isFinite(lon)){
-            placeUser(lat, lon, null);
-          } else {
-            alert('Enter valid lat/lon');
-          }
-        };
+        async function geocodeAndPlace(){
+          const q = (document.getElementById('uloc').value || '').trim();
+          if(!q){ alert('Enter a location'); return; }
+          try{
+            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=1`;
+            const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            if(!resp.ok){ alert('Geocoding failed'); return; }
+            const arr = await resp.json();
+            if(!arr || !arr.length){ alert('No results found'); return; }
+            const best = arr[0];
+            const lat = parseFloat(best.lat), lon = parseFloat(best.lon);
+            if(Number.isFinite(lat) && Number.isFinite(lon)){
+              placeUser(lat, lon, null);
+            } else {
+              alert('Invalid geocoding result');
+            }
+          }catch(e){ alert('Geocoding error'); }
+        }
+        document.getElementById('geocode').onclick = geocodeAndPlace;
 
         document.getElementById('pickOnMap').onclick = () => {
           pickMode = !pickMode;
