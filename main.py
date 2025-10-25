@@ -911,6 +911,11 @@ async def dashboard():
         <button id="geocode">Locate</button>
         <button id="pickOnMap">Pick on Map</button>
         <button id="recenter">Recenter</button>
+        <label style="margin-left:10px;">🔊 Voice Guidance <input type="checkbox" id="voiceToggle" /></label>
+        <label style="margin-left:8px;">Lang <select id="voiceLang" style="min-width:120px;"></select></label>
+        <label style="margin-left:8px;">Rate <input id="voiceRate" type="range" min="0.5" max="1.5" step="0.1" value="1.0" /></label>
+        <label style="margin-left:8px;">Step-by-step <input id="voiceStep" type="checkbox" checked /></label>
+        <button id="voiceRepeat" type="button">Repeat</button>
       </div>
       <div class="grid">
         <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
@@ -1039,6 +1044,106 @@ async def dashboard():
         let userCircle = null;
         let pickMode = false;
         const USER_RADIUS_METERS = 3000; // 3 km radius gate for visibility
+        let voiceEnabled = false;
+        let voiceLang = 'en';
+        let voiceRate = 1.0;
+        let voiceStepMode = true;
+        let lastSpeechText = '';
+        const synth = window.speechSynthesis;
+        let voiceList = [];
+
+        function populateVoices(){
+          try{
+            voiceList = synth.getVoices() || [];
+            const langs = Array.from(new Set(voiceList.map(v => v.lang))).sort();
+            const sel = document.getElementById('voiceLang');
+            if(!sel) return;
+            const prev = sel.value;
+            sel.innerHTML = '';
+            langs.forEach(l => {
+              const opt = document.createElement('option');
+              opt.value = l; opt.textContent = l;
+              sel.appendChild(opt);
+            });
+            if(prev){ sel.value = prev; }
+            else {
+              const best = langs.find(l => /^en/i.test(l)) || langs[0] || 'en-US';
+              sel.value = best;
+              voiceLang = best;
+            }
+          }catch(e){/* ignore */}
+        }
+        if('speechSynthesis' in window){
+          populateVoices();
+          if (typeof synth.onvoiceschanged !== 'undefined') {
+            synth.onvoiceschanged = populateVoices;
+          }
+        }
+
+        function speak(text){
+          try{
+            if(!voiceEnabled || !text || !('speechSynthesis' in window)) return;
+            // Stop any ongoing speech
+            synth.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.rate = voiceRate; u.pitch = 1.0; u.volume = 1.0;
+            // choose voice by selected language
+            const en = (voiceList || synth.getVoices() || []).find(v => v.lang === voiceLang) ||
+                       (voiceList || synth.getVoices() || []).find(v => v.lang && v.lang.startsWith(voiceLang.split('-')[0])) ||
+                       null;
+            if(en) u.voice = en;
+            synth.speak(u);
+            lastSpeechText = text;
+          }catch(e){/* ignore */}
+        }
+        function attachVoice(router){
+          if(!router) return;
+          router.on('routesfound', function(e){
+            if(!voiceEnabled) return;
+            try{
+              const route = e && e.routes && e.routes[0];
+              const parts = [];
+              if(route){
+                const hasSteps = route.instructions && route.instructions.length;
+                if(voiceStepMode && hasSteps){
+                  parts.push('Starting navigation.');
+                  route.instructions.forEach((ins, idx) => {
+                    if(!ins) return;
+                    let t = ins.text || '';
+                    parts.push(`Step ${idx+1}. ${t}`);
+                  });
+                }
+                // Always include summary at end
+                if(route.summary){
+                  const dkm = Math.round((route.summary.totalDistance||0)/100)/10;
+                  const min = Math.round((route.summary.totalTime||0)/60);
+                  parts.push(`Total distance ${dkm} kilometers. Estimated time ${min} minutes.`);
+                } else if(!voiceStepMode || !hasSteps) {
+                  parts.push('Route ready.');
+                }
+              }
+              const msg = parts.join(' ');
+              speak(msg);
+            }catch(err){/* ignore */}
+          });
+        }
+        document.getElementById('voiceToggle').addEventListener('change', (e)=>{
+          voiceEnabled = !!e.target.checked;
+          if(!voiceEnabled && synth){ synth.cancel(); }
+        });
+        document.getElementById('voiceLang').addEventListener('change', (e)=>{
+          voiceLang = e.target.value || 'en';
+        });
+        document.getElementById('voiceRate').addEventListener('input', (e)=>{
+          const v = parseFloat(e.target.value);
+          if(!isNaN(v)) voiceRate = v;
+        });
+        document.getElementById('voiceStep').addEventListener('change', (e)=>{
+          voiceStepMode = !!e.target.checked;
+        });
+        document.getElementById('voiceRepeat').addEventListener('click', ()=>{
+          if(lastSpeechText) speak(lastSpeechText);
+        });
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -1102,6 +1207,7 @@ async def dashboard():
                       waypoints: [ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ],
                       routeWhileDragging: false,
                     }).addTo(map);
+                    attachVoice(router);
                     return;
                   }
                   // Fallback to original 2-click routing between markers
@@ -1112,6 +1218,7 @@ async def dashboard():
                       waypoints: [ L.latLng(selected[0][0], selected[0][1]), L.latLng(selected[1][0], selected[1][1]) ],
                       routeWhileDragging: false,
                     }).addTo(map);
+                    attachVoice(router);
                   }
                 });
                 markers.set(key, { marker });

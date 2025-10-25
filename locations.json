@@ -117,5 +117,54 @@
     "roi": [],
     "lat": 17.385,
     "lon": 78.4867
+  },
+  "tmpru571lo5.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmp_919m8nq.mp4": {
+    "location_id": "Begumpet",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4566,
+    "lon": 78.501
+  },
+  "tmpjbzbpji1.mp4": {
+    "location_id": "Tank Bund",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4156,
+    "lon": 78.4747
+  },
+  "tmp4wuugqd5.mp4": {
+    "location_id": "LB Nagar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3566,
+    "lon": 78.557
+  },
+  "Times Square Crowd People 2 HD Video Background - Evaldas Marinskas (1080p, h264).mp4": {
+    "location_id": "Tank Bund",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4156,
+    "lon": 78.4747
+  },
+  "tmpqruymu7z.mp4": {
+    "location_id": "LB Nagar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3566,
+    "lon": 78.557
+  },
+  "tmpyh5t3pwg.mp4": {
+    "location_id": "Secunderabad Junction",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
   }
 }
