@@ -167,7 +167,10 @@ def _analyze_video_file(path: str, frame_stride: int = 5, resize_width: int = 96
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                # Loop: rewind to start and try again
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                idx = 0
+                continue
             if frame_stride > 1 and (idx % frame_stride) != 0:
                 idx += 1
                 continue
@@ -308,7 +311,10 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960, d
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                # Loop: rewind to start and continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                idx = 0
+                continue
             if frame_stride > 1 and (idx % frame_stride) != 0:
                 idx += 1
                 continue
@@ -482,6 +488,11 @@ async def dashboard():
             row.appendChild(cb); row.appendChild(lab);
             list.appendChild(row);
           });
+          try {
+            const lr = await fetch('/locations');
+            const lj = await lr.json();
+            locationsCache = lj.locations || {};
+          } catch(e) { locationsCache = {}; }
         }
 
         function stopAll() {
@@ -500,6 +511,29 @@ async def dashboard():
             document.getElementById(imgId).src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s + '&detector=' + det;
             document.getElementById(tId).textContent = c.value;
           });
+
+          // Pan map to selected locations and open popups once markers are ready
+          const pts = [];
+          checked.forEach(c => {
+            const cfg = locationsCache[c.value];
+            if(cfg && typeof cfg.lat === 'number' && typeof cfg.lon === 'number'){
+              pts.push([cfg.lat, cfg.lon]);
+            }
+          });
+          if(pts.length === 1){ map.flyTo(pts[0], 14); }
+          if(pts.length > 1){
+            const b = L.latLngBounds(pts.map(p => L.latLng(p[0], p[1])));
+            map.fitBounds(b.pad(0.2));
+          }
+          // Try to open the popups shortly after, when markers exist
+          setTimeout(() => {
+            checked.forEach(c => {
+              const key = c.value;
+              if(markers.has(key)){
+                markers.get(key).marker.openPopup();
+              }
+            });
+          }, 800);
         }
 
         document.getElementById('start').onclick = startSelected;
@@ -515,6 +549,7 @@ async def dashboard():
         const markers = new Map();
         let router = null;
         let selected = [];
+        let locationsCache = {};
 
         function sevClass(label){
           if(label === 'CRITICAL') return 'sev-critical';
@@ -530,7 +565,7 @@ async def dashboard():
 
         async function poll(){
           try{
-            const r = await fetch('/congestion');
+            const r = await fetch('/congestion?include_idle=0');
             const j = await r.json();
             if(!j.items) return;
             j.items.forEach(it => {
@@ -668,18 +703,16 @@ async def delete_location(filename: str):
     raise HTTPException(status_code=404, detail="filename not configured")
 
 @app.get("/congestion")
-async def congestion_feed():
-    # Return live metrics for map/dashboard.
-    # Merge current metrics with any geotagged locations so markers always show.
-    merged: Dict[str, Dict[str, object]] = {}
-    for k, v in GLOBAL_METRICS.items():
-        merged[k] = dict(v)
-    for fname, cfg in LOCATION_CONFIGS.items():
-        lat = cfg.get("lat")
-        lon = cfg.get("lon")
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            if fname not in merged:
-                merged[fname] = {
+async def congestion_feed(include_idle: int = 0):
+    # By default, return only active stream metrics (markers show only when videos are playing).
+    items = [dict(v) for v in GLOBAL_METRICS.values()]
+    # If explicitly requested, include geotagged but idle locations as SAFE with count=0
+    if include_idle:
+        for fname, cfg in LOCATION_CONFIGS.items():
+            lat = cfg.get("lat")
+            lon = cfg.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and fname not in GLOBAL_METRICS:
+                payload = {
                     "ts": int(time.time()),
                     "filename": fname,
                     "location_id": cfg.get("location_id") or fname,
@@ -690,17 +723,9 @@ async def congestion_feed():
                     "lon": float(lon),
                 }
                 if isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
-                    merged[fname]["density_m2"] = 0.0
-            else:
-                # Ensure lat/lon present in live metric if config has it
-                itm = merged[fname]
-                if "lat" not in itm:
-                    itm["lat"] = float(lat)
-                if "lon" not in itm:
-                    itm["lon"] = float(lon)
-                if "location_id" not in itm:
-                    itm["location_id"] = cfg.get("location_id") or fname
-    return JSONResponse({"items": list(merged.values())})
+                    payload["density_m2"] = 0.0
+                items.append(payload)
+    return JSONResponse({"items": items})
 
 if __name__ == "__main__":
     # For local testing: python main.py
