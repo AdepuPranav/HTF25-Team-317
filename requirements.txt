@@ -6,3 +6,5 @@ ultralytics>=8.0.0
 azure-storage-blob>=12.17.0
 azure-servicebus>=7.9.0
 python-dotenv>=1.0.0
+django>=5.0
+whitenoise>=6.6.0

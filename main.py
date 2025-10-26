@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import cv2
 import tempfile
@@ -38,6 +39,13 @@ except Exception:
 
 from fastapi import FastAPI
 app = FastAPI(title="Crowd Data Ingestion - Video Uploader")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8001", "http://127.0.0.1:8001"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def root():
@@ -908,7 +916,7 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960):
                 "location_id": loc_id,
                 "count": int(count),
                 "density_mp": round(float(dens), 3),
-                "severity": _severity_for_count(count)["label"],
+                "severity": sev.get('label', _severity_for_count(count)["label"]),
             }
             if cfg and isinstance(cfg.get("area_m2"), (int, float)) and cfg.get("area_m2"):
                 payload["density_m2"] = round((count / float(cfg["area_m2"])) if float(cfg["area_m2"]) > 0 else 0.0, 3)

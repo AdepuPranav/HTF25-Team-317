@@ -1,0 +1,425 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Crowd Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
+  <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
+  <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background:#0b1020; color:#e7e9ee; }
+    .header { padding: 12px 16px; text-align:center; background: linear-gradient(135deg,#0f172a,#111827); position:sticky; top:0; z-index:10; box-shadow:0 2px 10px rgba(0,0,0,0.4); }
+    .toolbar { display:flex; flex-direction:column; align-items:center; gap:8px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+    input[type=text] { background:#0f172a; color:#e7e9ee; border:1px solid #1f2937; border-radius:10px; padding:10px 12px; min-width:260px; }
+    button { background:#2563eb; color:#fff; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; }
+    button.secondary { background:#374151; }
+    #map { height: calc(100vh - 160px); margin: 8px 12px 16px; border-radius: 12px; box-shadow:0 10px 30px rgba(0,0,0,0.35); border:1px solid #1f2937; }
+    .badge { padding:2px 8px; border-radius:999px; font-weight:600; }
+    .safe { background:#11391c; color:#34d399; }
+    .moderate { background:#3b2f06; color:#fbbf24; }
+    .critical { background:#3a0d10; color:#f87171; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="toolbar">
+      <div class="row">
+        <button id="useLoc">Use Current Location</button>
+        <input id="uloc" type="text" placeholder="Enter location or 'lat,lon'" />
+        <button id="geocode">Locate</button>
+        <button id="pickOnMap" class="secondary">Pick on Map</button>
+        <button id="recenter" class="secondary">Recenter</button>
+      </div>
+      <div class="row">
+        <input id="dest" type="text" placeholder="Enter destination" />
+        <button id="routeBtn">Route</button>
+        <button id="avoidBtn" class="secondary" style="display:none">Avoid Crowds</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="alertBox" style="display:none;position:fixed;top:16px;right:16px;background:#c62828;color:#fff;padding:12px 14px;border-radius:10px;z-index:1000;box-shadow:0 8px 20px rgba(0,0,0,0.35);"></div>
+  <div id="map"></div>
+
+  <script>
+    const BACKEND = "{{ BACKEND_BASE }}";
+
+    const map = L.map('map').setView([20.5937, 78.9629], 5);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    const markers = new Map();
+    let router = null;
+    let lastWaypoints = null; // array of L.latLng
+    let lastRouteCoords = null; // array of {lat,lng}
+    const USER_RADIUS_METERS = 3000;
+    let userMarker = null;
+    let userCircle = null;
+    let pickMode = false;
+    let heatLayer = null;
+    let rerouteGuard = false;
+    let alertHideTimer = null;
+    const perSourcePopupAt = {}; // source -> last popup ms
+    // keep references to hidden streams so they aren't GC'd
+    const hiddenStreams = [];
+
+    function sevClass(label){
+      label = (label||'').toUpperCase();
+      if(label==='CRITICAL') return 'critical';
+      if(label==='MODERATE') return 'moderate';
+      return 'safe';
+    }
+    function sevColor(label){
+      label = (label||'').toUpperCase();
+      if(label==='CRITICAL') return '#f87171';
+      if(label==='MODERATE') return '#fbbf24';
+      return '#34d399';
+    }
+
+    async function poll(){
+      try{
+        let r = await fetch(`${BACKEND}/congestion?include_idle=0`);
+        let j = await r.json();
+        // If no active items, show idle geotagged markers and try to start hidden streams
+        if(!j.items || !j.items.length){
+          try { await ensureHiddenStreams(); } catch(_){}
+          r = await fetch(`${BACKEND}/congestion?include_idle=1`);
+          j = await r.json();
+        }
+        if(!j.items) return;
+        const heat = [];
+        const u = userMarker ? userMarker.getLatLng() : null;
+        j.items.forEach(it => {
+          if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
+          const key = it.filename;
+          const mll = L.latLng(it.lat, it.lon);
+          const sev = (it.severity||'').toString().toUpperCase();
+          const inRange = u ? (map.distance(mll, u) <= USER_RADIUS_METERS) : true;
+          const crowded = sev !== 'SAFE';
+          const shouldShow = inRange && crowded;
+          const intensity = sev === 'CRITICAL' ? 1.0 : (sev === 'MODERATE' ? 0.6 : 0.25);
+          heat.push([it.lat, it.lon, intensity]);
+          if(!shouldShow){
+            if(markers.has(key)){
+              const { marker } = markers.get(key);
+              map.removeLayer(marker);
+              markers.delete(key);
+            }
+            return;
+          }
+          const html = `<b>${it.location_id || key}</b><br/>`+
+                       `<span class="badge ${sevClass(it.severity)}">${it.severity}</span><br/>`+
+                       `Count: ${it.count}<br/>Density: ${(it.density_mp??0).toFixed(2)}/MP`+
+                       (it.density_m2? `<br/>${it.density_m2.toFixed(2)}/m²` : '');
+          const radius = Math.min(30, 6 + (it.count||0));
+          const color = sevColor(it.severity);
+          if(markers.has(key)){
+            const { marker } = markers.get(key);
+            marker.setLatLng([it.lat, it.lon]);
+            marker.setStyle({ color, fillColor: color, radius });
+            marker.bindPopup(html);
+          } else {
+            const marker = L.circleMarker([it.lat, it.lon], { radius, color, fillColor: color, fillOpacity: 0.7, weight: 2 }).addTo(map).bindPopup(html);
+            marker.on('click', () => {
+              // If user location is known, route from user to this marker; else 2-click routing
+              if(userMarker){
+                const u = userMarker.getLatLng();
+                createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ]);
+                return;
+              }
+            });
+            markers.set(key, { marker });
+          }
+        });
+        if(!heatLayer){ heatLayer = L.heatLayer([], { radius: 26, blur: 18, maxZoom: 19 }).addTo(map); }
+        heatLayer.setLatLngs(heat);
+
+        // Toggle Avoid button visibility if critical near user
+        const ab = document.getElementById('avoidBtn');
+        if(ab && userMarker){
+          const um = userMarker.getLatLng();
+          let anyCritical = false;
+          markers.forEach(({ marker }) => {
+            const mll = marker.getLatLng();
+            if(map.distance(mll, um) <= USER_RADIUS_METERS){
+              const content = marker.getPopup() && marker.getPopup().getContent();
+              if(typeof content === 'string' && content.includes('CRITICAL')){ anyCritical = true; }
+            }
+          });
+          ab.style.display = anyCritical ? 'inline-block' : 'none';
+        }
+
+        // Dynamic reroute if current route becomes unsafe
+        if(router && lastWaypoints && lastRouteCoords && userMarker){
+          try{
+            const u0 = lastWaypoints[0];
+            const d0 = lastWaypoints[lastWaypoints.length-1];
+            const crit = collectCriticalNearAny(u0, d0);
+            if(isRouteUnsafe(lastRouteCoords, crit) && !rerouteGuard){
+              rerouteGuard = true;
+              createRouterWithSafety(lastWaypoints);
+              setTimeout(()=>{ rerouteGuard = false; }, 1000);
+            }
+          }catch(_){ }
+        }
+      }catch(e){}
+      setTimeout(poll, 3000);
+    }
+
+    poll();
+
+    // Safety helpers and ML route scoring
+    function toRad(d){ return d * Math.PI / 180; }
+    function toDeg(r){ return r * 180 / Math.PI; }
+    function collectCriticalNearAny(u, d){
+      const crit = [];
+      markers.forEach(({ marker }) => {
+        const mll = marker.getLatLng();
+        let near = false;
+        if(u){ near = near || (map.distance(mll, u) <= USER_RADIUS_METERS); }
+        if(d){ near = near || (map.distance(mll, d) <= USER_RADIUS_METERS); }
+        if(!near) return;
+        const content = marker.getPopup() && marker.getPopup().getContent();
+        if(typeof content === 'string' && content.includes('CRITICAL')){ crit.push([mll.lat, mll.lng]); }
+      });
+      return crit;
+    }
+    function isRouteUnsafe(routeCoords, crit, thresholdMeters=200){
+      if(!crit.length || !routeCoords || !routeCoords.length) return false;
+      for(const c of crit){
+        const cll = L.latLng(c[0], c[1]);
+        for(const rc of routeCoords){
+          const rll = L.latLng(rc.lat, rc.lng);
+          if(map.distance(cll, rll) <= thresholdMeters){ return true; }
+        }
+      }
+      return false;
+    }
+    function computeDetourWaypoint(u, detourMeters){
+      // pick perpendicular direction from nearest critical centroid
+      const crit = collectCriticalNearAny(u, u);
+      if(!crit.length) return null;
+      const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+      const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+      const vx = cx - u.lat; const vy = cy - u.lng; // vector to crowd
+      let px = vy, py = -vx; // perpendicular
+      const norm = Math.hypot(px, py) || 1; px/=norm; py/=norm;
+      const perpBearing = toDeg(Math.atan2(py, px));
+      const R = 6371000; const δ = detourMeters / R; const br = toRad(perpBearing);
+      const φ1 = toRad(u.lat), λ1 = toRad(u.lng);
+      const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
+      const sinφ2 = sinφ1*Math.cos(δ) + cosφ1*Math.sin(δ)*Math.cos(br);
+      const φ2 = Math.asin(sinφ2); const y = Math.sin(br)*Math.sin(δ)*cosφ1; const x = Math.cos(δ) - sinφ1*Math.sin(φ2);
+      const λ2 = λ1 + Math.atan2(y, x);
+      return L.latLng(toDeg(φ2), toDeg(λ2));
+    }
+    async function scoreRouteML(route){
+      try{
+        const path = (route.coordinates||[]).map(p => ({ lat: p.lat, lng: p.lng }));
+        const body = { path, timestamp: new Date().toISOString() };
+        const r = await fetch(`${BACKEND}/ml/score_route`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if(!r.ok) throw new Error('ml score failed');
+        const j = await r.json();
+        return typeof j.predicted_time_seconds === 'number' ? j.predicted_time_seconds : Infinity;
+      }catch(_){ return Infinity; }
+    }
+    async function selectBestAlternative(router, e){
+      try{
+        const routes = e && e.routes ? e.routes : [];
+        if(!routes.length) return;
+        const scores = await Promise.all(routes.map(rt => scoreRouteML(rt)));
+        let bestIdx = 0; for(let i=1;i<scores.length;i++){ if(scores[i] < scores[bestIdx]) bestIdx = i; }
+        if(bestIdx !== 0){ try{ if(typeof router._selectRoute === 'function'){ router._selectRoute(routes[bestIdx]); } }catch(_){ } }
+      }catch(_){ }
+    }
+    function createRouterWithSafety(waypoints){
+      if(router){ map.removeControl(router); router=null; }
+      router = L.Routing.control({
+        waypoints,
+        routeWhileDragging: false,
+        addWaypoints: false,
+        draggableWaypoints: false,
+        showAlternatives: true,
+        router: L.Routing.osrmv1({ serviceUrl: 'https://router.project-osrm.org/route/v1', profile: 'foot', alternatives: 3 }),
+        createMarker: () => null,
+      }).addTo(map);
+      lastWaypoints = waypoints.slice();
+      router.on('routesfound', async (e) => {
+        const route = e.routes && e.routes[0]; if(!route) return;
+        lastRouteCoords = route.coordinates.map(p=>({lat:p.lat, lng:p.lng}));
+        const u = waypoints[0]; const d = waypoints[waypoints.length-1];
+        const crit = collectCriticalNearAny(u, d);
+        if(isRouteUnsafe(lastRouteCoords, crit) && !rerouteGuard){
+          rerouteGuard = true;
+          const detour = computeDetourWaypoint(u, 1000);
+          if(detour){ createRouterWithSafety([ L.latLng(u.lat, u.lng), detour, L.latLng(d.lat, d.lng) ]); }
+          setTimeout(()=>{ rerouteGuard = false; }, 1000);
+          return;
+        }
+        await selectBestAlternative(router, e);
+      });
+    }
+
+    function placeUser(lat, lon){
+      const latlng = L.latLng(lat, lon);
+      if(userMarker){ userMarker.setLatLng(latlng); }
+      else { userMarker = L.marker(latlng, { title: 'You' }).addTo(map).bindPopup('You are here'); }
+      if(userCircle){ userCircle.setLatLng(latlng); userCircle.setRadius(USER_RADIUS_METERS); }
+      else { userCircle = L.circle(latlng, { radius: USER_RADIUS_METERS, color: '#2563eb', fillColor: '#60a5fa', fillOpacity: 0.15 }).addTo(map); }
+      map.flyTo(latlng, Math.max(14, map.getZoom()));
+      const tf = document.getElementById('uloc');
+      tf.value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+    }
+
+    function geocodeOnce(q){
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=1`;
+      return fetch(url, { headers: { 'Accept': 'application/json' } }).then(r=>r.json()).then(arr=>{
+        if(!arr||!arr.length) throw new Error('no results');
+        return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon), name: arr[0].display_name };
+      });
+    }
+
+    document.getElementById('useLoc').onclick = () => {
+      if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => { placeUser(pos.coords.latitude, pos.coords.longitude); },
+        (err) => { alert('Failed: ' + err.message); },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    };
+
+    document.getElementById('geocode').onclick = async () => {
+      const q = (document.getElementById('uloc').value||'').trim();
+      if(!q){ alert('Enter location'); return; }
+      try{
+        if(/^-?\d+\.\d+\s*,\s*-?\d+\.\d+$/.test(q)){
+          const [la, lo] = q.split(',').map(s=>parseFloat(s.trim()));
+          placeUser(la, lo);
+          return;
+        }
+        const res = await geocodeOnce(q);
+        placeUser(res.lat, res.lon);
+      }catch(e){ alert('Geocoding failed'); }
+    };
+
+    document.getElementById('pickOnMap').onclick = () => {
+      pickMode = !pickMode;
+      document.getElementById('pickOnMap').textContent = pickMode ? 'Picking…' : 'Pick on Map';
+    };
+    map.on('click', (e) => { if(!pickMode) return; pickMode=false; document.getElementById('pickOnMap').textContent='Pick on Map'; placeUser(e.latlng.lat, e.latlng.lng); });
+
+    document.getElementById('recenter').onclick = () => {
+      if(userMarker){ map.flyTo(userMarker.getLatLng(), Math.max(14, map.getZoom())); userMarker.openPopup(); }
+    };
+
+    let destMarker = null;
+    let destCircle = null;
+
+    document.getElementById('routeBtn').onclick = async () => {
+      if(!userMarker){ alert('Set your current location first'); return; }
+      const q = (document.getElementById('dest').value||'').trim();
+      if(!q){ alert('Enter a destination'); return; }
+      try{
+        const d = await geocodeOnce(q);
+        const u = userMarker.getLatLng();
+        const waypoints = [ L.latLng(u.lat, u.lng), L.latLng(d.lat, d.lon) ];
+        createRouterWithSafety(waypoints);
+        if(destMarker){ destMarker.setLatLng([d.lat, d.lon]); }
+        else { destMarker = L.marker([d.lat, d.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); }
+        if(destCircle){ destCircle.setLatLng([d.lat, d.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
+        else { destCircle = L.circle([d.lat, d.lon], { radius: USER_RADIUS_METERS, color: '#2563eb', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+      }catch(e){ alert('Routing failed'); }
+    };
+
+    document.getElementById('avoidBtn').onclick = () => {
+      if(!userMarker) return;
+      const u = userMarker.getLatLng();
+      // find nearby CRITICAL markers and push a waypoint away from centroid
+      const crit = [];
+      markers.forEach(({ marker }) => {
+        const mll = marker.getLatLng();
+        const content = marker.getPopup() && marker.getPopup().getContent();
+        if(map.distance(mll, u) <= USER_RADIUS_METERS && typeof content==='string' && content.includes('CRITICAL')){
+          crit.push([mll.lat, mll.lng]);
+        }
+      });
+      if(!crit.length) return;
+      const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
+      const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
+      const toRad = d=>d*Math.PI/180; const toDeg=r=>r*180/Math.PI;
+      const dy = toRad(cx - u.lat); const dx = toRad(cy - u.lng) * Math.cos(toRad((u.lat+cx)/2));
+      const bearing = Math.atan2(dx, dy);
+      const awayDeg = (toDeg(bearing) + 180) % 360;
+      const R = 6371000; const dist = 1000; // 1km
+      const br = toRad(awayDeg); const φ1 = toRad(u.lat); const λ1 = toRad(u.lng); const δ = dist / R;
+      const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
+      const sinφ2 = sinφ1*Math.cos(δ) + cosφ1*Math.sin(δ)*Math.cos(br);
+      const φ2 = Math.asin(sinφ2);
+      const y = Math.sin(br) * Math.sin(δ) * cosφ1; const x = Math.cos(δ) - sinφ1*Math.sin(φ2);
+      const λ2 = λ1 + Math.atan2(y, x);
+      const lat = toDeg(φ2), lon = toDeg(λ2);
+      const waypoints = [ L.latLng(u.lat, u.lng), L.latLng(lat, lon) ];
+      createRouterWithSafety(waypoints);
+    };
+
+    // Alerts popup from backend
+    async function pollAlerts(){
+      try{
+        const r = await fetch(`${BACKEND}/alerts/by_source`);
+        if(!r.ok) return;
+        const j = await r.json();
+        const by = j && j.by_source ? j.by_source : {};
+        const entries = Object.values(by);
+        if(!entries.length || !userMarker) return;
+        const u = userMarker.getLatLng(); const now = Date.now();
+        for(const a of entries){
+          if(!a || (a.severity||'').toUpperCase() !== 'CRITICAL') continue;
+          const src = a.source || 'unknown';
+          if(!markers.has(src)) continue;
+          const m = markers.get(src).marker;
+          const dist = map.distance(m.getLatLng(), u);
+          if(dist > USER_RADIUS_METERS) continue;
+          const lastAt = perSourcePopupAt[src] || 0;
+          if(now - lastAt < 30000) continue;
+          const box = document.getElementById('alertBox');
+          box.textContent = `[${a.time}] ${a.severity} @ ${src} — ${a.message}`;
+          box.style.display = 'block';
+          if(alertHideTimer) clearTimeout(alertHideTimer);
+          alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 3000);
+          perSourcePopupAt[src] = now; break;
+        }
+      }catch(_){ }
+    }
+    setInterval(pollAlerts, 2000);
+
+    // Start hidden video streams to drive live metrics without showing videos
+    async function ensureHiddenStreams(){
+      if(hiddenStreams.length) return; // already started
+      try{
+        const r = await fetch(`${BACKEND}/videos/demo`);
+        const j = await r.json();
+        const vids = Array.isArray(j.videos) ? j.videos : [];
+        if(!vids.length) return;
+        const stride = 2;
+        vids.forEach(v => {
+          if(!v || !v.filename) return;
+          const img = new Image();
+          // keep it off-DOM and visually hidden
+          img.style.position = 'absolute';
+          img.style.left = '-99999px';
+          img.style.width = '1px';
+          img.style.height = '1px';
+          img.alt = '';
+          img.src = `${BACKEND}/videos/stream?filename=${encodeURIComponent(v.filename)}&frame_stride=${stride}`;
+          hiddenStreams.push(img);
+        });
+      }catch(_){ }
+    }
+    // Kick off hidden streams once at startup
+    ensureHiddenStreams();
+  </script>
+</body>
+</html>

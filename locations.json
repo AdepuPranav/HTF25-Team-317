@@ -670,5 +670,103 @@
     "roi": [],
     "lat": 17.3693,
     "lon": 78.5609
+  },
+  "3.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "4.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmp8vy3dpvs.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpunqy5z3s.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpuzeg5n68.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpxxpo5iju.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpzqhx9kye.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpg49eblg9.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmp8rdwx1nz.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
+  },
+  "tmpfi66cqb0.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
+  },
+  "tmpkbfgz7d7.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpvz_yrybp.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpnqmtc1tq.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpkyak_swh.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
   }
 }
