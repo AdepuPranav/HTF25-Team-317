@@ -3,47 +3,837 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Live Crowd Map</title>
+  <title>SmartCrowd - Live Crowd Management System</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
   <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
   <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
   <style>
-    body { font-family: system-ui, sans-serif; margin: 0; background:#0b1020; color:#e7e9ee; }
-    .header { padding: 12px 16px; text-align:center; background: linear-gradient(135deg,#0f172a,#111827); position:sticky; top:0; z-index:10; box-shadow:0 2px 10px rgba(0,0,0,0.4); }
-    .toolbar { display:flex; flex-direction:column; align-items:center; gap:8px; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
-    input[type=text] { background:#0f172a; color:#e7e9ee; border:1px solid #1f2937; border-radius:10px; padding:10px 12px; min-width:260px; }
-    button { background:#2563eb; color:#fff; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; }
-    button.secondary { background:#374151; }
-    #map { height: calc(100vh - 160px); margin: 8px 12px 16px; border-radius: 12px; box-shadow:0 10px 30px rgba(0,0,0,0.35); border:1px solid #1f2937; }
-    .badge { padding:2px 8px; border-radius:999px; font-weight:600; }
-    .safe { background:#11391c; color:#34d399; }
-    .moderate { background:#3b2f06; color:#fbbf24; }
-    .critical { background:#3a0d10; color:#f87171; }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body { 
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+      background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+      color: #e7e9ee; 
+      overflow-x: hidden;
+    }
+
+    .app-container {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 1rem 2rem;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+    }
+
+    .header-content {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .logo i {
+      font-size: 2rem;
+      color: #fff;
+    }
+
+    .logo h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: #fff;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+
+    .status-indicators {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(255,255,255,0.1);
+      padding: 0.5rem 1rem;
+      border-radius: 20px;
+      backdrop-filter: blur(10px);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4ade80;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* Main Content */
+    .main-content {
+      flex: 1;
+      display: flex;
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 1rem;
+      gap: 1rem;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 350px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 1.5rem;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.1);
+      height: fit-content;
+    }
+
+    .sidebar h3 {
+      color: #fff;
+      margin-bottom: 1rem;
+      font-size: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .control-group {
+      margin-bottom: 1.5rem;
+    }
+
+    .control-group label {
+      display: block;
+      margin-bottom: 0.5rem;
+      color: #a1a1aa;
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+
+    .input-group {
+      position: relative;
+      margin-bottom: 0.75rem;
+    }
+
+    .input-group i {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: #6b7280;
+      z-index: 1;
+    }
+
+    input[type=text] { 
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 12px 16px 12px 40px;
+      width: 100%;
+      font-size: 0.9rem;
+      transition: all 0.3s ease;
+    }
+
+    input[type=text]:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+
+    input[type=text]::placeholder {
+      color: #6b7280;
+    }
+
+    .btn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      width: 100%;
+      justify-content: center;
+      margin-bottom: 0.75rem;
+    }
+
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+    }
+
+    .btn.secondary {
+      background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
+    }
+
+    .btn.secondary:hover {
+      box-shadow: 0 8px 25px rgba(107, 114, 128, 0.3);
+    }
+
+    .btn.danger {
+      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    }
+
+    .btn.danger:hover {
+      box-shadow: 0 8px 25px rgba(239, 68, 68, 0.3);
+    }
+
+    /* Map Container */
+    .map-container {
+      flex: 1;
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 1rem;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.1);
+      position: relative;
+    }
+
+    #map { 
+      height: calc(100vh - 200px);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+
+    /* Notification Dropdown */
+    .notifications-container {
+      position: fixed;
+      top: 90px;
+      right: 20px;
+      z-index: 2000;
+      max-width: 400px;
+    }
+
+    .notifications-dropdown {
+      background: rgba(15, 23, 42, 0.95);
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.1);
+      max-height: 500px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .notifications-header {
+      padding: 1rem 1.5rem;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+
+    .notifications-header h3 {
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 0;
+    }
+
+    .notifications-count {
+      background: rgba(255,255,255,0.2);
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+    }
+
+    .notifications-list {
+      max-height: 450px;
+      overflow-y: auto;
+    }
+
+    .notification-item {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      animation: slideIn 0.3s ease;
+    }
+
+    .notification-item:hover {
+      background: rgba(255,255,255,0.05);
+    }
+
+    .notification-item:last-child {
+      border-bottom: none;
+    }
+
+    .notification-item.critical {
+      border-left: 4px solid #ef4444;
+    }
+
+    .notification-item.location {
+      border-left: 4px solid #667eea;
+    }
+
+    .notification-item .notification-time {
+      font-size: 0.75rem;
+      color: #a1a1aa;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .notification-item .notification-content {
+      color: #fff;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .notification-item .notification-content i {
+      color: #667eea;
+    }
+
+    .notification-item.critical .notification-content i {
+      color: #ef4444;
+    }
+
+    .notification-close {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: #fff;
+      cursor: pointer;
+      opacity: 0.5;
+      transition: opacity 0.3s ease;
+    }
+
+    .notification-close:hover {
+      opacity: 1;
+    }
+
+    .notification-item-empty {
+      padding: 3rem 1.5rem;
+      text-align: center;
+      color: #a1a1aa;
+    }
+
+    .notification-item-empty i {
+      font-size: 2rem;
+      margin-bottom: 0.5rem;
+      color: #667eea;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* Alert Box (single popup) */
+    #alertBox {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+      color: #fff;
+      padding: 1rem 1.5rem;
+      border-radius: 12px;
+      z-index: 2000;
+      box-shadow: 0 10px 30px rgba(239, 68, 68, 0.3);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.2);
+      max-width: 400px;
+      display: none;
+      animation: slideIn 0.3s ease;
+    }
+
+    /* Badges */
+    .badge { 
+      padding: 4px 12px; 
+      border-radius: 20px; 
+      font-weight: 600; 
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+
+    .safe { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #fff; }
+    .moderate { background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); color: #fff; }
+    .critical { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); color: #fff; }
+
+    /* Stats Cards */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .stat-card {
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+      padding: 1rem;
+      border: 1px solid rgba(255,255,255,0.1);
+      backdrop-filter: blur(10px);
+    }
+
+    .stat-card h4 {
+      color: #a1a1aa;
+      font-size: 0.8rem;
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .stat-card .value {
+      color: #fff;
+      font-size: 1.5rem;
+      font-weight: 700;
+    }
+
+    /* Responsive Design */
+    @media (max-width: 1024px) {
+      .main-content {
+        flex-direction: column;
+      }
+      
+      .sidebar {
+        width: 100%;
+      }
+      
+      #map {
+        height: 400px;
+      }
+    }
+
+    @media (max-width: 768px) {
+      .header-content {
+        flex-direction: column;
+        gap: 1rem;
+      }
+      
+      .status-indicators {
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      
+      .main-content {
+        padding: 0.5rem;
+      }
+    }
+
+    /* Loading Animation */
+    .loading {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      border-top-color: #fff;
+      animation: spin 1s ease-in-out infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: rgba(255,255,255,0.1);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.3);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(255,255,255,0.5);
+    }
+
+    /* Voice Assistant */
+    .voice-assistant {
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 1.5rem;
+      margin-top: 1rem;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+
+    .assistant-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.5rem;
+    }
+
+    .assistant-header h3 {
+      color: #fff;
+      font-size: 1.2rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .assistant-header h3 i {
+      color: #667eea;
+      font-size: 1.3rem;
+    }
+
+    .assistant-controls {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .voice-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 10px 20px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: all 0.3s ease;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+    }
+
+    .voice-btn:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+    }
+
+    .voice-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .voice-btn.stop {
+      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    }
+
+    .voice-btn.stop:hover {
+      box-shadow: 0 8px 25px rgba(239, 68, 68, 0.3);
+    }
+
+    .assistant-status {
+      padding: 1rem;
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.1);
+      text-align: center;
+      color: #a1a1aa;
+      font-size: 0.9rem;
+    }
+
+    .assistant-status i {
+      font-size: 2rem;
+      color: #667eea;
+      margin-bottom: 0.5rem;
+      display: block;
+    }
+
+    .assistant-status.active {
+      background: rgba(102, 126, 234, 0.1);
+      border-color: #667eea;
+      color: #fff;
+    }
+
+    .assistant-status.active i {
+      animation: pulse 2s infinite;
+    }
+
+    .current-instruction {
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+      padding: 1.5rem;
+      border: 1px solid rgba(255,255,255,0.1);
+      margin-bottom: 1rem;
+    }
+
+    .current-instruction h4 {
+      color: #a1a1aa;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .current-instruction p {
+      color: #fff;
+      font-size: 1.1rem;
+      font-weight: 500;
+      margin: 0;
+      line-height: 1.5;
+    }
+
+    .assistant-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: 0.75rem;
+      background: rgba(255,255,255,0.05);
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+
+    .stat-item .label {
+      color: #a1a1aa;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+    }
+
+    .stat-item .value {
+      color: #fff;
+      font-size: 1.3rem;
+      font-weight: 700;
+    }
+
+    @media (max-width: 768px) {
+      .assistant-header {
+        flex-direction: column;
+        gap: 1rem;
+        align-items: stretch;
+      }
+
+      .assistant-controls {
+        flex-direction: column;
+      }
+
+      .voice-btn {
+        width: 100%;
+        justify-content: center;
+      }
+
+      .assistant-stats {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
+  <div class="app-container">
+    <!-- Header -->
   <div class="header">
-    <div class="toolbar">
-      <div class="row">
-        <button id="useLoc">Use Current Location</button>
-        <input id="uloc" type="text" placeholder="Enter location or 'lat,lon'" />
-        <button id="geocode">Locate</button>
-        <button id="pickOnMap" class="secondary">Pick on Map</button>
-        <button id="recenter" class="secondary">Recenter</button>
+      <div class="header-content">
+        <div class="logo">
+          <i class="fas fa-users"></i>
+          <h1>SmartCrowd</h1>
+        </div>
+        <div class="status-indicators">
+          <div class="status-item">
+            <div class="status-dot"></div>
+            <span>Live</span>
+          </div>
+          <div class="status-item">
+            <i class="fas fa-map-marker-alt"></i>
+            <span id="locationCount">0 Locations</span>
+          </div>
+          <div class="status-item">
+            <i class="fas fa-exclamation-triangle"></i>
+            <span id="alertCount">0 Alerts</span>
+          </div>
+        </div>
       </div>
-      <div class="row">
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <!-- Stats Cards -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <h4><i class="fas fa-users"></i> Total Crowd</h4>
+            <div class="value" id="totalCrowd">0</div>
+          </div>
+          <div class="stat-card">
+            <h4><i class="fas fa-exclamation-circle"></i> Critical Areas</h4>
+            <div class="value" id="criticalAreas">0</div>
+          </div>
+          <div class="stat-card">
+            <h4><i class="fas fa-route"></i> Active Routes</h4>
+            <div class="value" id="activeRoutes">0</div>
+          </div>
+          <div class="stat-card">
+            <h4><i class="fas fa-clock"></i> Last Update</h4>
+            <div class="value" id="lastUpdate">--:--</div>
+          </div>
+        </div>
+
+        <!-- Location Controls -->
+        <div class="control-group">
+          <h3><i class="fas fa-map-marker-alt"></i> Location</h3>
+          <div class="input-group">
+            <i class="fas fa-location-dot"></i>
+        <input id="uloc" type="text" placeholder="Enter location or 'lat,lon'" />
+      </div>
+          <button id="useLoc" class="btn">
+            <i class="fas fa-crosshairs"></i>
+            Use Current Location
+          </button>
+          <button id="geocode" class="btn secondary">
+            <i class="fas fa-search"></i>
+            Locate
+          </button>
+          <button id="pickOnMap" class="btn secondary">
+            <i class="fas fa-hand-pointer"></i>
+            Pick on Map
+          </button>
+          <button id="recenter" class="btn secondary">
+            <i class="fas fa-compress-arrows-alt"></i>
+            Recenter
+          </button>
+        </div>
+
+        <!-- Routing Controls -->
+        <div class="control-group">
+          <h3><i class="fas fa-route"></i> Navigation</h3>
+          <div class="input-group">
+            <i class="fas fa-flag"></i>
         <input id="dest" type="text" placeholder="Enter destination" />
-        <button id="routeBtn">Route</button>
-        <button id="avoidBtn" class="secondary" style="display:none">Avoid Crowds</button>
+      </div>
+          <button id="routeBtn" class="btn">
+            <i class="fas fa-directions"></i>
+            Plan Route
+          </button>
+    </div>
+  </div>
+
+      <!-- Map Container -->
+      <div class="map-container">
+  <div id="map"></div>
+        
+        <!-- Voice Assistant -->
+        <div class="voice-assistant">
+          <div class="assistant-header">
+            <h3><i class="fas fa-microphone-alt"></i> Voice Assistant</h3>
+            <div class="assistant-controls">
+              <button id="startVoiceBtn" class="voice-btn">
+                <i class="fas fa-volume-up"></i>
+                <span>Start Guidance</span>
+              </button>
+              <button id="stopVoiceBtn" class="voice-btn stop" style="display: none;">
+                <i class="fas fa-stop"></i>
+                <span>Stop</span>
+              </button>
+            </div>
+          </div>
+          
+          <div id="assistantContent">
+            <div class="assistant-status" id="assistantStatus">
+              <i class="fas fa-route"></i>
+              <p>No active route</p>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
-  <div id="alertBox" style="display:none;position:fixed;top:16px;right:16px;background:#c62828;color:#fff;padding:12px 14px;border-radius:10px;z-index:1000;box-shadow:0 8px 20px rgba(0,0,0,0.35);"></div>
-  <div id="map"></div>
+  <!-- Alert Box (single popup) -->
+  <div id="alertBox"></div>
+
+  <!-- Notifications Dropdown -->
+  <div class="notifications-container" id="notificationsContainer" style="display: none;">
+    <div class="notifications-dropdown">
+      <div class="notifications-header">
+        <h3>
+          <i class="fas fa-bell"></i>
+          Notifications
+          <span class="notifications-count" id="notificationCount">0</span>
+        </h3>
+        <i class="fas fa-times" id="closeNotifications" style="cursor: pointer; opacity: 0.7;"></i>
+      </div>
+      <div class="notifications-list" id="notificationsList">
+        <div class="notification-item-empty">
+          <i class="fas fa-inbox"></i>
+          <p>No notifications yet</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Locations Dropdown -->
+  <div class="notifications-container" id="locationsContainer" style="display: none; top: 90px; right: 440px;">
+    <div class="notifications-dropdown">
+      <div class="notifications-header" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%);">
+        <h3>
+          <i class="fas fa-map-marked-alt"></i>
+          Monitoring Locations
+          <span class="notifications-count" id="locationsCount">0</span>
+        </h3>
+        <i class="fas fa-times" id="closeLocations" style="cursor: pointer; opacity: 0.7;"></i>
+      </div>
+      <div class="notifications-list" id="locationsList">
+        <div class="notification-item-empty">
+          <i class="fas fa-map-pin"></i>
+          <p>No locations being monitored yet</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script>
     const BACKEND = "{{ BACKEND_BASE }}";
@@ -58,6 +848,8 @@
     const USER_RADIUS_METERS = 3000;
     let userMarker = null;
     let userCircle = null;
+    let destMarker = null; // destination marker
+    let destCircle = null; // destination circle
     let pickMode = false;
     let heatLayer = null;
     let rerouteGuard = false;
@@ -65,6 +857,259 @@
     const perSourcePopupAt = {}; // source -> last popup ms
     // keep references to hidden streams so they aren't GC'd
     const hiddenStreams = [];
+
+    // Stats tracking
+    let stats = {
+      totalCrowd: 0,
+      criticalAreas: 0,
+      activeRoutes: 0,
+      lastUpdate: new Date()
+    };
+
+    // Update stats display
+    function updateStats() {
+      document.getElementById('totalCrowd').textContent = stats.totalCrowd;
+      document.getElementById('criticalAreas').textContent = stats.criticalAreas;
+      document.getElementById('activeRoutes').textContent = stats.activeRoutes;
+      document.getElementById('lastUpdate').textContent = stats.lastUpdate.toLocaleTimeString();
+      document.getElementById('locationCount').textContent = `${markers.size} Locations`;
+    }
+
+    // Initialize stats
+    updateStats();
+
+    // Auto re-route when user location changes
+    function onUserLocationChanged() {
+      if (userMarker && destMarker && router) {
+        const userPos = userMarker.getLatLng();
+        const destPos = destMarker.getLatLng();
+        
+        // Create new route with updated user position
+        createRouterWithSafety([userPos, destPos]);
+        
+        // Update last waypoints
+        lastWaypoints = [userPos, destPos];
+      }
+    }
+
+    // Voice Assistant Implementation
+    let speechSynthesis = window.speechSynthesis;
+    let isVoiceActive = false;
+    let routeInstructions = [];
+    let currentStep = 0;
+    let instructionInterval = null;
+
+    // Get OSRM route instructions
+    async function getRouteInstructions(waypoints) {
+      try {
+        const start = waypoints[0];
+        const end = waypoints[waypoints.length - 1];
+        
+        const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?steps=true&geometries=geojson&overview=full`;
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.routes && data.routes[0] && data.routes[0].legs) {
+          const leg = data.routes[0].legs[0];
+          return leg.steps.map((step, index) => {
+            // Simplify instructions for better voice guidance
+            let instruction = step.maneuver.instruction || '';
+            const type = step.maneuver.type;
+            const modifier = step.maneuver.modifier || '';
+            const distance = step.distance;
+            
+            // Create user-friendly instructions
+            let friendlyInstruction = '';
+            
+            if (type === 'depart' || type === 'start') {
+              friendlyInstruction = 'Start your journey. Head straight ahead.';
+            } else if (type === 'turn') {
+              const direction = modifier || 'left';
+              const dist = distance > 1000 ? `${(distance/1000).toFixed(1)} kilometers` : `${Math.round(distance)} meters`;
+              friendlyInstruction = `In ${dist}, turn ${direction}. ${instruction}`;
+            } else if (type === 'merge') {
+              friendlyInstruction = `Merge onto the road. ${instruction}`;
+            } else if (type === 'fork') {
+              const side = modifier || 'left';
+              friendlyInstruction = `Take the ${side} fork. ${instruction}`;
+            } else if (type === 'arrive' || type === 'end') {
+              friendlyInstruction = 'You have arrived at your destination.';
+            } else if (type === 'ramp') {
+              const dist = distance > 1000 ? `${(distance/1000).toFixed(1)} kilometers` : `${Math.round(distance)} meters`;
+              friendlyInstruction = `In ${dist}, take the ramp. ${instruction}`;
+            } else if (type === 'roundabout') {
+              const dist = distance > 1000 ? `${(distance/1000).toFixed(1)} kilometers` : `${Math.round(distance)} meters`;
+              friendlyInstruction = `In ${dist}, enter the roundabout and take the ${modifier || 'first'} exit.`;
+            } else if (type === 'continue') {
+              const dist = distance > 1000 ? `${(distance/1000).toFixed(1)} kilometers` : `${Math.round(distance)} meters`;
+              friendlyInstruction = `Continue straight for ${dist}. ${instruction}`;
+            } else {
+              // Fallback
+              friendlyInstruction = instruction || `Step ${index + 1}. Continue following the route.`;
+            }
+            
+            return {
+              instruction: friendlyInstruction.trim(),
+              distance: step.distance,
+              duration: step.duration,
+              type: type,
+              original: instruction
+            };
+          });
+        }
+      } catch (error) {
+        console.error('Error getting route instructions:', error);
+      }
+      return [];
+    }
+
+    // Speak an instruction
+    function speakInstruction(text) {
+      if (!speechSynthesis) return;
+      
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 0.9;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+      utterance.lang = 'en-US';
+      
+      utterance.onstart = () => {
+        console.log('Speaking:', text);
+      };
+      
+      utterance.onend = () => {
+        console.log('Speech ended');
+        if (isVoiceActive && currentStep < routeInstructions.length - 1) {
+          currentStep++;
+          // Wait a bit before speaking next instruction
+          setTimeout(() => {
+            if (isVoiceActive && routeInstructions[currentStep]) {
+              speakInstruction(routeInstructions[currentStep].instruction);
+            }
+          }, 500);
+          updateVoiceDisplay();
+        } else if (isVoiceActive && currentStep >= routeInstructions.length - 1) {
+          console.log('Route completed');
+          stopVoiceAssistant();
+          setTimeout(() => {
+            speakInstruction('You have reached your destination');
+          }, 500);
+        }
+      };
+      
+      utterance.onerror = (event) => {
+        console.error('Speech error:', event);
+        stopVoiceAssistant();
+      };
+      
+      console.log('Starting speech synthesis...');
+      speechSynthesis.speak(utterance);
+    }
+
+    // Update voice assistant display
+    function updateVoiceDisplay() {
+      const content = document.getElementById('assistantContent');
+      
+      if (router && routeInstructions.length > 0 && isVoiceActive) {
+        const current = routeInstructions[currentStep];
+        const distance = current.distance > 1000 ? 
+          `${(current.distance / 1000).toFixed(1)} km` : 
+          `${Math.round(current.distance)} m`;
+        
+        document.getElementById('assistantStatus').innerHTML = `
+          <div class="current-instruction">
+            <h4><i class="fas fa-directions"></i> Current Instruction</h4>
+            <p>${current.instruction}</p>
+          </div>
+          <div class="assistant-stats">
+            <div class="stat-item">
+              <div class="label">Step</div>
+              <div class="value">${currentStep + 1}/${routeInstructions.length}</div>
+            </div>
+            <div class="stat-item">
+              <div class="label">Distance</div>
+              <div class="value">${distance}</div>
+            </div>
+            <div class="stat-item">
+              <div class="label">Status</div>
+              <div class="value">Active</div>
+            </div>
+          </div>
+        `;
+        document.getElementById('assistantStatus').classList.add('active');
+      } else if (router && routeInstructions.length > 0 && !isVoiceActive) {
+        document.getElementById('assistantStatus').innerHTML = `
+          <i class="fas fa-route"></i>
+          <p>Route ready. Click "Start Guidance" to begin.</p>
+          <div style="margin-top: 1rem;">
+            <small>Route: ${routeInstructions.length} steps</small>
+          </div>
+        `;
+      } else {
+        document.getElementById('assistantStatus').innerHTML = `
+          <i class="fas fa-route"></i>
+          <p>No active route</p>
+        `;
+      }
+    }
+
+    // Start voice assistant
+    function startVoiceAssistant() {
+      if (!router || routeInstructions.length === 0) {
+        alert('Please create a route first');
+        return;
+      }
+      
+      console.log('Starting voice assistant, instructions:', routeInstructions);
+      
+      // If speech was active, stop it first
+      if (speechSynthesis.speaking) {
+        speechSynthesis.cancel();
+      }
+      
+      isVoiceActive = true;
+      currentStep = 0;
+      
+      document.getElementById('startVoiceBtn').style.display = 'none';
+      document.getElementById('stopVoiceBtn').style.display = 'flex';
+      
+      // Update display first
+      updateVoiceDisplay();
+      
+      // Then start speaking with a small delay to ensure everything is ready
+      setTimeout(() => {
+        if (routeInstructions[currentStep]) {
+          speakInstruction(routeInstructions[currentStep].instruction);
+        }
+      }, 100);
+    }
+
+    // Stop voice assistant
+    function stopVoiceAssistant() {
+      isVoiceActive = false;
+      
+      if (speechSynthesis) {
+        speechSynthesis.cancel();
+      }
+      
+      if (instructionInterval) {
+        clearInterval(instructionInterval);
+        instructionInterval = null;
+      }
+      
+      document.getElementById('startVoiceBtn').style.display = 'flex';
+      document.getElementById('stopVoiceBtn').style.display = 'none';
+      
+      updateVoiceDisplay();
+    }
+
+    // Event listeners
+    document.getElementById('startVoiceBtn').addEventListener('click', startVoiceAssistant);
+    document.getElementById('stopVoiceBtn').addEventListener('click', stopVoiceAssistant);
+
+    // Initialize voice display
+    updateVoiceDisplay();
 
     function sevClass(label){
       label = (label||'').toUpperCase();
@@ -90,6 +1135,14 @@
           j = await r.json();
         }
         if(!j.items) return;
+        
+        // Update stats
+        stats.totalCrowd = j.items.reduce((sum, item) => sum + (item.count || 0), 0);
+        stats.criticalAreas = j.items.filter(item => (item.severity || '').toUpperCase() === 'CRITICAL').length;
+        stats.activeRoutes = router ? 1 : 0;
+        stats.lastUpdate = new Date();
+        updateStats();
+        
         const heat = [];
         const u = userMarker ? userMarker.getLatLng() : null;
         j.items.forEach(it => {
@@ -131,26 +1184,23 @@
                 return;
               }
             });
-            markers.set(key, { marker });
+            markers.set(key, { marker, locationName: it.location_id || key });
           }
         });
         if(!heatLayer){ heatLayer = L.heatLayer([], { radius: 26, blur: 18, maxZoom: 19 }).addTo(map); }
         heatLayer.setLatLngs(heat);
 
-        // Toggle Avoid button visibility if critical near user
-        const ab = document.getElementById('avoidBtn');
-        if(ab && userMarker){
-          const um = userMarker.getLatLng();
-          let anyCritical = false;
-          markers.forEach(({ marker }) => {
-            const mll = marker.getLatLng();
-            if(map.distance(mll, um) <= USER_RADIUS_METERS){
-              const content = marker.getPopup() && marker.getPopup().getContent();
-              if(typeof content === 'string' && content.includes('CRITICAL')){ anyCritical = true; }
+        // Track new locations being monitored (log them once when they first appear)
+        if (markers.size > 0) {
+          markers.forEach((markerData, key) => {
+            if (!markerData.notified && markerData.locationName) {
+              addMonitoringLocation(markerData.locationName, new Date().toISOString());
+              markerData.notified = true;
             }
           });
-          ab.style.display = anyCritical ? 'inline-block' : 'none';
         }
+
+        // Note: Avoid button removed as requested
 
         // Dynamic reroute if current route becomes unsafe
         if(router && lastWaypoints && lastRouteCoords && userMarker){
@@ -250,6 +1300,12 @@
       router.on('routesfound', async (e) => {
         const route = e.routes && e.routes[0]; if(!route) return;
         lastRouteCoords = route.coordinates.map(p=>({lat:p.lat, lng:p.lng}));
+        
+        // Get route instructions for voice assistant
+        routeInstructions = await getRouteInstructions(waypoints);
+        currentStep = 0;
+        updateVoiceDisplay();
+        
         const u = waypoints[0]; const d = waypoints[waypoints.length-1];
         const crit = collectCriticalNearAny(u, d);
         if(isRouteUnsafe(lastRouteCoords, crit) && !rerouteGuard){
@@ -272,6 +1328,9 @@
       map.flyTo(latlng, Math.max(14, map.getZoom()));
       const tf = document.getElementById('uloc');
       tf.value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+      
+      // Auto re-route if destination is set
+      onUserLocationChanged();
     }
 
     function geocodeOnce(q){
@@ -315,9 +1374,6 @@
       if(userMarker){ map.flyTo(userMarker.getLatLng(), Math.max(14, map.getZoom())); userMarker.openPopup(); }
     };
 
-    let destMarker = null;
-    let destCircle = null;
-
     document.getElementById('routeBtn').onclick = async () => {
       if(!userMarker){ alert('Set your current location first'); return; }
       const q = (document.getElementById('dest').value||'').trim();
@@ -327,45 +1383,34 @@
         const u = userMarker.getLatLng();
         const waypoints = [ L.latLng(u.lat, u.lng), L.latLng(d.lat, d.lon) ];
         createRouterWithSafety(waypoints);
-        if(destMarker){ destMarker.setLatLng([d.lat, d.lon]); }
-        else { destMarker = L.marker([d.lat, d.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); }
-        if(destCircle){ destCircle.setLatLng([d.lat, d.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
-        else { destCircle = L.circle([d.lat, d.lon], { radius: USER_RADIUS_METERS, color: '#2563eb', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
+        
+        // Set or update destination marker
+        if(destMarker){ 
+          destMarker.setLatLng([d.lat, d.lon]); 
+        } else { 
+          destMarker = L.marker([d.lat, d.lon], { title: 'Destination' }).addTo(map).bindPopup('Destination'); 
+        }
+        
+        // Set or update destination circle
+        if(destCircle){ 
+          destCircle.setLatLng([d.lat, d.lon]); 
+          destCircle.setRadius(USER_RADIUS_METERS); 
+        } else { 
+          destCircle = L.circle([d.lat, d.lon], { radius: USER_RADIUS_METERS, color: '#2563eb', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); 
+        }
+        
+        // Update last waypoints for auto re-routing
+        lastWaypoints = waypoints;
       }catch(e){ alert('Routing failed'); }
     };
 
-    document.getElementById('avoidBtn').onclick = () => {
-      if(!userMarker) return;
-      const u = userMarker.getLatLng();
-      // find nearby CRITICAL markers and push a waypoint away from centroid
-      const crit = [];
-      markers.forEach(({ marker }) => {
-        const mll = marker.getLatLng();
-        const content = marker.getPopup() && marker.getPopup().getContent();
-        if(map.distance(mll, u) <= USER_RADIUS_METERS && typeof content==='string' && content.includes('CRITICAL')){
-          crit.push([mll.lat, mll.lng]);
-        }
-      });
-      if(!crit.length) return;
-      const cx = crit.reduce((a,c)=>a+c[0],0)/crit.length;
-      const cy = crit.reduce((a,c)=>a+c[1],0)/crit.length;
-      const toRad = d=>d*Math.PI/180; const toDeg=r=>r*180/Math.PI;
-      const dy = toRad(cx - u.lat); const dx = toRad(cy - u.lng) * Math.cos(toRad((u.lat+cx)/2));
-      const bearing = Math.atan2(dx, dy);
-      const awayDeg = (toDeg(bearing) + 180) % 360;
-      const R = 6371000; const dist = 1000; // 1km
-      const br = toRad(awayDeg); const φ1 = toRad(u.lat); const λ1 = toRad(u.lng); const δ = dist / R;
-      const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
-      const sinφ2 = sinφ1*Math.cos(δ) + cosφ1*Math.sin(δ)*Math.cos(br);
-      const φ2 = Math.asin(sinφ2);
-      const y = Math.sin(br) * Math.sin(δ) * cosφ1; const x = Math.cos(δ) - sinφ1*Math.sin(φ2);
-      const λ2 = λ1 + Math.atan2(y, x);
-      const lat = toDeg(φ2), lon = toDeg(λ2);
-      const waypoints = [ L.latLng(u.lat, u.lng), L.latLng(lat, lon) ];
-      createRouterWithSafety(waypoints);
-    };
-
     // Alerts popup from backend
+    let lastShownAlert = null; // Track last shown alert to prevent repetition
+    let notificationsLog = []; // Store all notifications
+    let uniqueLocations = new Set(); // Track unique location names
+    let monitoredLocations = []; // Store unique monitoring locations
+    let alertCount = 0; // Track alert count
+    
     async function pollAlerts(){
       try{
         const r = await fetch(`${BACKEND}/alerts/by_source`);
@@ -373,6 +1418,7 @@
         const j = await r.json();
         const by = j && j.by_source ? j.by_source : {};
         const entries = Object.values(by);
+        
         if(!entries.length || !userMarker) return;
         const u = userMarker.getLatLng(); const now = Date.now();
         for(const a of entries){
@@ -382,18 +1428,195 @@
           const m = markers.get(src).marker;
           const dist = map.distance(m.getLatLng(), u);
           if(dist > USER_RADIUS_METERS) continue;
-          const lastAt = perSourcePopupAt[src] || 0;
-          if(now - lastAt < 30000) continue;
+          
+          // Get the location_id from the marker popup to show proper location name
+          let locationName = src;
+          try {
+            const markerInfo = markers.get(src);
+            if (markerInfo && markerInfo.marker) {
+              const popupContent = markerInfo.marker.getPopup().getContent();
+              // Extract location name from popup HTML
+              const match = popupContent.match(/<b>([^<]+)<\/b>/);
+              if (match) locationName = match[1];
+            }
+          } catch(e) {
+            console.log('Could not extract location name:', e);
+          }
+          
+          // Check if this exact alert was already shown
+          const alertKey = locationName + '_' + a.time;
+          if(lastShownAlert === alertKey) continue;
+          
+          const lastAt = perSourcePopupAt[locationName] || 0;
+          if(now - lastAt < 60000) continue; // Increase cooldown to 60 seconds to reduce repetition
+          
           const box = document.getElementById('alertBox');
-          box.textContent = `[${a.time}] ${a.severity} @ ${src} — ${a.message}`;
+          
+          box.innerHTML = `
+            <div style="display: flex; align-items: flex-start; gap: 0.75rem;">
+              <i class="fas fa-exclamation-triangle" style="color: #ef4444; font-size: 1.2rem; margin-top: 0.2rem;"></i>
+              <div style="flex: 1;">
+                <div style="font-size: 0.8rem; opacity: 0.9; margin-bottom: 0.5rem;">
+                  ${new Date(a.time).toLocaleTimeString()}
+                </div>
+                <div style="font-weight: 600;">
+                  <i class="fas fa-map-marker-alt" style="margin-right: 0.5rem;"></i>
+                  ${locationName}
+                </div>
+              </div>
+            </div>
+          `;
           box.style.display = 'block';
           if(alertHideTimer) clearTimeout(alertHideTimer);
-          alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 3000);
-          perSourcePopupAt[src] = now; break;
+          alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 5000);
+          perSourcePopupAt[locationName] = now;
+          lastShownAlert = alertKey;
+          
+          // Add to notifications log
+          addNotification(locationName, a.time);
+          
+          // Increment alert count
+          alertCount++;
+          document.getElementById('alertCount').textContent = `${alertCount} Alerts`;
+          
+          break;
         }
       }catch(_){ }
     }
     setInterval(pollAlerts, 2000);
+
+    // Add critical alert to log
+    function addNotification(locationName, time) {
+      const notification = {
+        id: Date.now(),
+        locationName: locationName,
+        time: time,
+        timestamp: Date.now()
+      };
+      
+      notificationsLog.unshift(notification);
+      updateNotificationsDisplay();
+      
+      // Show dropdown if it's not already visible
+      const container = document.getElementById('notificationsContainer');
+      if (container && container.style.display === 'none') {
+        container.style.display = 'block';
+      }
+    }
+
+    // Add unique location to monitoring list
+    function addMonitoringLocation(locationName, time) {
+      // Check if location is already tracked
+      if (!uniqueLocations.has(locationName)) {
+        uniqueLocations.add(locationName);
+        
+        const location = {
+          id: Date.now(),
+          locationName: locationName,
+          time: time,
+          timestamp: Date.now()
+        };
+        
+        monitoredLocations.unshift(location);
+        updateLocationsDisplay();
+      }
+    }
+
+    // Update notifications display
+    function updateNotificationsDisplay() {
+      const list = document.getElementById('notificationsList');
+      const count = document.getElementById('notificationCount');
+      
+      if (notificationsLog.length === 0) {
+        list.innerHTML = `
+          <div class="notification-item-empty">
+            <i class="fas fa-inbox"></i>
+            <p>No notifications yet</p>
+          </div>
+        `;
+        count.textContent = '0';
+      } else {
+        count.textContent = notificationsLog.length;
+        list.innerHTML = notificationsLog.map(n => `
+          <div class="notification-item ${n.type}" onclick="focusOnLocation('${n.locationName}')">
+            <div class="notification-time">
+              <i class="fas fa-clock"></i>
+              ${new Date(n.time).toLocaleTimeString()}
+            </div>
+            <div class="notification-content">
+              <i class="fas fa-exclamation-triangle"></i>
+              ${n.title}
+            </div>
+            <div style="color: #a1a1aa; font-size: 0.85rem; margin-top: 0.25rem;">📍 ${n.locationName}</div>
+          </div>
+        `).join('');
+      }
+    }
+
+    // Update locations display
+    function updateLocationsDisplay() {
+      const list = document.getElementById('locationsList');
+      const count = document.getElementById('locationsCount');
+      
+      if (monitoredLocations.length === 0) {
+        list.innerHTML = `
+          <div class="notification-item-empty">
+            <i class="fas fa-map-pin"></i>
+            <p>No locations being monitored yet</p>
+          </div>
+        `;
+        count.textContent = '0';
+      } else {
+        count.textContent = monitoredLocations.length;
+        list.innerHTML = monitoredLocations.map(loc => `
+          <div class="notification-item location" onclick="focusOnLocation('${loc.locationName}')">
+            <div class="notification-time">
+              <i class="fas fa-clock"></i>
+              ${new Date(loc.time).toLocaleTimeString()}
+            </div>
+            <div class="notification-content">
+              <i class="fas fa-map-marker-alt"></i>
+              ${loc.locationName}
+            </div>
+          </div>
+        `).join('');
+      }
+    }
+
+    // Focus on location when clicking a notification
+    function focusOnLocation(locationName) {
+      // Find the marker for this location
+      markers.forEach((markerData, key) => {
+        const popupContent = markerData.marker.getPopup().getContent();
+        if (popupContent.includes(locationName)) {
+          markerData.marker.openPopup();
+          map.setView(markerData.marker.getLatLng(), Math.max(14, map.getZoom()));
+        }
+      });
+    }
+
+    // Close notifications dropdown
+    document.getElementById('closeNotifications').addEventListener('click', () => {
+      document.getElementById('notificationsContainer').style.display = 'none';
+    });
+
+    // Close locations dropdown
+    document.getElementById('closeLocations').addEventListener('click', () => {
+      document.getElementById('locationsContainer').style.display = 'none';
+    });
+
+    // Toggle notifications dropdown when clicking header status
+    const alertStatus = document.querySelector('.status-item:last-child');
+    if (alertStatus) {
+      alertStatus.style.cursor = 'pointer';
+      alertStatus.addEventListener('click', () => {
+        const container = document.getElementById('notificationsContainer');
+        if (container) {
+          container.style.display = container.style.display === 'none' ? 'block' : 'none';
+        }
+      });
+    }
+
 
     // Start hidden video streams to drive live metrics without showing videos
     async function ensureHiddenStreams(){

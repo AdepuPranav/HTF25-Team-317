@@ -1034,6 +1034,7 @@ async def dashboard():
         <button id="voiceStop" type="button">Stop Voice</button>
         <button id="avoidBtn" style="display:none;background:#c62828;color:#fff;">Avoid Crowds</button>
         <br/>
+        <span id="critCounter" style="display:inline-block;margin-top:6px;padding:2px 8px;border-radius:12px;background:#ffe6e6;color:#b71c1c;font-weight:600;">Critical appearances: 0</span>
         <input id="dest" type="text" placeholder="Enter destination" style="width:280px;margin-top:6px;" />
         <button id="routeBtn">Route to Destination</button>
       </div>
@@ -1043,8 +1044,9 @@ async def dashboard():
       <div id="map"></div>
       <script>
         let videos = [];
+        // Single inline alert popup state (no dropdown)
         let alertHideTimer = null;
-        let perSourcePopupAt = {}; // source -> last popup ms
+        const perSourcePopupAt = {}; // source -> last popup ms
         async function load() {
           const r = await fetch('/videos/demo');
           const j = await r.json();
@@ -1131,53 +1133,51 @@ async def dashboard():
                 markers.get(key).marker.openPopup();
               }
             });
-            // Initialize and update heat layer
-            try{
-              if(!heatLayer){
-                heatLayer = L.heatLayer([], { radius: 26, blur: 18, maxZoom: 19 });
-                heatLayer.addTo(map);
-              }
-              heatLayer.setLatLngs(heat);
-            }catch(_){ }
           }, 800);
         }
 
+
+        document.getElementById('start').onclick = startSelected;
+        document.getElementById('stop').onclick = stopAll;
+        load();
+        // poll alerts to show a single inline popup with YOLOv8 readings
         async function pollAlerts(){
           try{
-            const r = await fetch('/alerts/by_source');
-            if(!r.ok) return;
-            const j = await r.json();
-            const by = j && j.by_source ? j.by_source : {};
+            const ar = await fetch('/alerts/by_source');
+            if(!ar.ok) return;
+            const aj = await ar.json();
+            const by = aj && aj.by_source ? aj.by_source : {};
             const entries = Object.values(by);
             if(!entries.length) return;
-            if(!userMarker) return; // No user location -> suppress alerts
-            const u = userMarker.getLatLng();
+            // get latest congestion snapshot (include idle to ensure presence)
+            const cr = await fetch('/congestion?include_idle=1');
+            if(!cr.ok) return;
+            const cj = await cr.json();
+            const items = cj && cj.items ? cj.items : [];
+            const byFile = new Map(items.map(it => [it.filename, it]));
             const now = Date.now();
             for(const a of entries){
               if(!a || (a.severity||'').toUpperCase() !== 'CRITICAL') continue;
               const src = a.source || 'unknown';
-              // Require a visible marker in range
-              if(!markers.has(src)) continue;
-              const m = markers.get(src).marker;
-              const dist = map.distance(m.getLatLng(), u);
-              if(dist > USER_RADIUS_METERS) continue;
               const lastAt = perSourcePopupAt[src] || 0;
-              if(now - lastAt < 30000) continue; // 30s cooldown per source
+              if(now - lastAt < 60000) continue; // 60s cooldown per source
+              const it = byFile.get(src);
+              // Build message from YOLOv8 readings; avoid undefined
+              const loc = it && (it.location_id || src) || src;
+              const count = it && typeof it.count === 'number' ? it.count : 0;
+              const dmp = it && typeof it.density_mp === 'number' ? it.density_mp.toFixed(2) : '0.00';
+              const dm2 = it && typeof it.density_m2 === 'number' ? ` • ${it.density_m2.toFixed(2)}/m²` : '';
               const box = document.getElementById('alertBox');
               box.style.background = '#c62828';
-              box.textContent = `[${a.time}] ${a.severity} @ ${src} — ` + a.message;
+              box.textContent = `CRITICAL @ ${loc} — Count ${count}, Density ${dmp}/MP${dm2}`;
               box.style.display = 'block';
               if(alertHideTimer) clearTimeout(alertHideTimer);
               alertHideTimer = setTimeout(()=>{ box.style.display='none'; }, 3000);
               perSourcePopupAt[src] = now;
               break; // show one at a time
             }
-          }catch(e){}
+          }catch(_){ }
         }
-
-        document.getElementById('start').onclick = startSelected;
-        document.getElementById('stop').onclick = stopAll;
-        load();
         setInterval(pollAlerts, 2000);
 
         // OSM + OSRM map setup
@@ -1202,6 +1202,9 @@ async def dashboard():
         let voiceStepMode = true;
         let lastSpeechText = '';
         const synth = window.speechSynthesis;
+        // Track CRITICAL appearances on the live map
+        const criticalLive = new Set(); // filenames currently visible as CRITICAL
+        let criticalAppearances = 0; // increments only when a new CRITICAL marker appears
         let voiceList = [];
         let geoWatchId = null; // geolocation watch id
         // Persistence keys
@@ -1570,6 +1573,8 @@ async def dashboard():
               const intensity = sev === 'CRITICAL' ? 1.0 : (sev === 'MODERATE' ? 0.6 : 0.25);
               heat.push([it.lat, it.lon, intensity]);
               if(!shouldShow){
+                // If marker not shown or out of range, remove from critical live set
+                if(criticalLive.has(key)) criticalLive.delete(key);
                 if(markers.has(key)){
                   const { marker } = markers.get(key);
                   map.removeLayer(marker);
@@ -1586,18 +1591,11 @@ async def dashboard():
               const color = sevColor(it.severity);
               if(markers.has(key)){
                 const { marker } = markers.get(key);
-                marker.setLatLng([it.lat, it.lon]);
-                marker.setStyle({ color, fillColor: color, radius });
-                marker.bindPopup(html);
+                marker.setLatLng(mll);
+                marker.setIcon(iconForSeverity(sev));
+                marker.setPopupContent(html);
               } else {
-                const marker = L.circleMarker([it.lat, it.lon], { radius, color, fillColor: color, fillOpacity: 0.7, weight: 2 }).addTo(map).bindPopup(html);
-                marker.on('click', () => {
-                  // If user location is known, route from user to this marker.
-                  if(userMarker){
-                    const u = userMarker.getLatLng();
-                    if(router){ map.removeControl(router); router=null; }
-                    createRouterWithSafety([ L.latLng(u.lat, u.lng), L.latLng(it.lat, it.lon) ]);
-                    return;
+                const marker = L.marker(mll, { icon: iconForSeverity(sev) }).bindPopup(html).addTo(map);
                   }
                   // Fallback to original 2-click routing between markers
                   if(selected.length === 2){ selected = []; if(router){ map.removeControl(router); router=null; } }
