@@ -973,15 +973,7 @@ async def score_route(body: Dict[str, object]):
             continue
     if len(norm) < 2:
         raise HTTPException(status_code=400, detail="insufficient coordinates after normalization")
-    # decimate to max 200 points to limit CPU
-    try:
-        stride = max(1, len(norm) // 200)
-        if stride > 1:
-            norm = norm[::stride] + [norm[-1]]
-    except Exception:
-        pass
-    # offload computation to a worker thread to avoid blocking streaming generator
-    total_sec = await asyncio.to_thread(_predict_route_time_seconds, norm, when if isinstance(when, str) else None)
+    total_sec = _predict_route_time_seconds(norm, when if isinstance(when, str) else None)
     return JSONResponse({"predicted_time_seconds": round(float(total_sec), 2)})
 
 @app.get("/dashboard")
@@ -1092,27 +1084,12 @@ async def dashboard():
           if (grid) { grid.innerHTML = ''; }
         }
 
-        let rotateTimer = null;
-        const ROTATE_COUNT = 3;
-        const ROTATE_MS = 20000; // 20s per rotation
-
-        function rotateStop(){ if(rotateTimer){ clearInterval(rotateTimer); rotateTimer = null; } }
-
-        function stopAll() {
-          rotateStop();
-          const grid = document.getElementById('grid');
-          if (grid) { grid.innerHTML = ''; }
-        }
-
-        function startSelected(offset=0) {
+        function startSelected() {
           stopAll();
           const s = document.getElementById('stride').value || 2;
-          const all = Array.from(document.querySelectorAll('#list input[type=checkbox]:checked'));
+          const checked = Array.from(document.querySelectorAll('#list input[type=checkbox]:checked'));
           const grid = document.getElementById('grid');
-          if(all.length === 0){ return; }
-          const n = Math.min(ROTATE_COUNT, all.length);
-          for(let i=0;i<n;i++){
-            const c = all[(offset + i) % all.length];
+          checked.forEach((c, idx) => {
             const panel = document.createElement('div');
             panel.className = 'panel';
             const title = document.createElement('h4');
@@ -1123,34 +1100,14 @@ async def dashboard():
             panel.appendChild(title);
             panel.appendChild(img);
             grid.appendChild(panel);
-          }
-          // start rotation
-          let k = offset;
-          rotateTimer = setInterval(() => {
-            k = (k + ROTATE_COUNT) % all.length;
-            startSelected(k);
-          }, ROTATE_MS);
-        }
+          });
 
-        // Pan map to selected locations and open popups once markers are ready
-        const pts = [];
-        checked.forEach(c => {
-          const cfg = locationsCache[c.value];
-          if(cfg && typeof cfg.lat === 'number' && typeof cfg.lon === 'number'){
-            pts.push([cfg.lat, cfg.lon]);
-          }
-        });
-        if(pts.length === 1){ map.flyTo(pts[0], 14); }
-        if(pts.length > 1){
-          const b = L.latLngBounds(pts.map(p => L.latLng(p[0], p[1])));
-          map.fitBounds(b.pad(0.2));
-        }
-        // Try to open the popups shortly after, when markers exist
-        setTimeout(() => {
+          // Pan map to selected locations and open popups once markers are ready
+          const pts = [];
           checked.forEach(c => {
-            const key = c.value;
-            if(markers.has(key)){
-              markers.get(key).marker.openPopup();
+            const cfg = locationsCache[c.value];
+            if(cfg && typeof cfg.lat === 'number' && typeof cfg.lon === 'number'){
+              pts.push([cfg.lat, cfg.lon]);
             }
           });
           if(pts.length === 1){ map.flyTo(pts[0], 14); }
@@ -1166,6 +1123,14 @@ async def dashboard():
                 markers.get(key).marker.openPopup();
               }
             });
+            // Initialize and update heat layer
+            try{
+              if(!heatLayer){
+                heatLayer = L.heatLayer([], { radius: 26, blur: 18, maxZoom: 19 });
+                heatLayer.addTo(map);
+              }
+              heatLayer.setLatLngs(heat);
+            }catch(_){ }
           }, 800);
         }
 

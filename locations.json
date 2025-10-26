@@ -656,5 +656,19 @@
     "roi": [],
     "lat": 17.385,
     "lon": 78.4867
+  },
+  "tmpea0fsj_s.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpznc6mucu.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
   }
 }
