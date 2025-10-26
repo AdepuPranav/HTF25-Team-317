@@ -446,5 +446,33 @@
     "roi": [],
     "lat": 17.4566,
     "lon": 78.501
+  },
+  "tmpam8ztza8.mp4": {
+    "location_id": "Begumpet",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4566,
+    "lon": 78.501
+  },
+  "tmpj86o11vt.mp4": {
+    "location_id": "KPHB",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4933,
+    "lon": 78.3996
+  },
+  "tmpm8tl7m6a.mp4": {
+    "location_id": "LB Nagar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3566,
+    "lon": 78.557
+  },
+  "tmpdgcfs5mc.mp4": {
+    "location_id": "HITEC City",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4435,
+    "lon": 78.3772
   }
 }
