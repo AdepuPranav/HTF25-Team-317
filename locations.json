@@ -1,17 +1,17 @@
 {
   "1.mp4": {
-    "location_id": "Secunderabad Railway Station",
+    "location_id": "Uppal",
     "area_m2": 1000.0,
     "roi": [],
-    "lat": 17.4399,
-    "lon": 78.4983
+    "lat": 17.4025091,
+    "lon": 78.5612562
   },
   "2.mp4": {
-    "location_id": "Uppal, Telangana",
+    "location_id": "Nagole",
     "area_m2": 1000.0,
     "roi": [],
-    "lat": 17.4056,
-    "lon": 78.5596
+    "lat": 17.3775306,
+    "lon": 78.5601231
   },
   "tmpcdq_60z7.mp4": {
     "location_id": "KPHB",
@@ -28,11 +28,11 @@
     "lon": 78.3772
   },
   "4k video Crowd waiting to get into queue evening shot tear temple Free Video Stock Footage - Free Video Stock Footages (1080p, h264).mp4": {
-    "location_id": "KPHB",
+    "location_id": "Secunderabad",
     "area_m2": 1000.0,
     "roi": [],
-    "lat": 17.4933,
-    "lon": 78.3996
+    "lat": 17.4337246,
+    "lon": 78.5006827
   },
   "tmp1gytz0l5.mp4": {
     "location_id": "Tank Bund",
@@ -147,11 +147,11 @@
     "lon": 78.557
   },
   "Times Square Crowd People 2 HD Video Background - Evaldas Marinskas (1080p, h264).mp4": {
-    "location_id": "Tank Bund",
+    "location_id": "Abids",
     "area_m2": 1000.0,
     "roi": [],
-    "lat": 17.4156,
-    "lon": 78.4747
+    "lat": 17.3894783,
+    "lon": 78.477182
   },
   "tmpqruymu7z.mp4": {
     "location_id": "LB Nagar",
@@ -474,5 +474,187 @@
     "roi": [],
     "lat": 17.4435,
     "lon": 78.3772
+  },
+  "tmpm90qncmc.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpj9x_nb7g.mp4": {
+    "location_id": "LB Nagar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3566,
+    "lon": 78.557
+  },
+  "tmp5kmn0yuu.mp4": {
+    "location_id": "Secunderabad Junction",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpbzyi73fa.mp4": {
+    "location_id": "Begumpet",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4566,
+    "lon": 78.501
+  },
+  "tmplxriumiu.mp4": {
+    "location_id": "Secunderabad Junction",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpx0xqw3iq.mp4": {
+    "location_id": "Begumpet",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4566,
+    "lon": 78.501
+  },
+  "tmp94rh17cp.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpiie7th34.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpxqqpd4z5.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmp8pk8fuay.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmp8eam7e06.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpb4k5ww1x.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmph_xqcydn.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmpvpem09j5.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
+  },
+  "tmp4u88i2db.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpweb9pqap.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpufo3io0b.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmp3dq1ve8j.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpf5agrc1a.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
+  },
+  "tmpxq9ie60d.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmp8jyy6wbp.mp4": {
+    "location_id": "Secunderabad railway station",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4399,
+    "lon": 78.4983
+  },
+  "tmplw8i2jaq.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpx2_kcoq8.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
+  },
+  "tmpe7270xn3.mp4": {
+    "location_id": "Nagole",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.3693,
+    "lon": 78.5609
+  },
+  "tmp1e1w77qf.mp4": {
+    "location_id": "Marredpally",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.4479,
+    "lon": 78.5029
+  },
+  "tmpygdy296h.mp4": {
+    "location_id": "Charminar",
+    "area_m2": 1000.0,
+    "roi": [],
+    "lat": 17.385,
+    "lon": 78.4867
   }
 }

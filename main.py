@@ -10,6 +10,8 @@ import json
 from typing import Dict, List, Optional
 from collections import deque
 from datetime import datetime
+import csv
+import math
 import hashlib
 try:
     from ultralytics import YOLO  # type: ignore
@@ -78,6 +80,110 @@ GLOBAL_METRICS: Dict[str, Dict[str, object]] = {}
 
 # Per-source severity smoothing and cooldown state
 SEVERITY_STATE: Dict[str, Dict[str, object]] = {}
+
+# Traffic dataset and prediction helpers (vehicle congestion)
+TRAFFIC_DATA: List[Dict[str, object]] = []
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def _load_traffic_csv(path: str = 'hyderabad_synth.csv') -> None:
+    global TRAFFIC_DATA
+    TRAFFIC_DATA = []
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    ts = row.get('timestamp')
+                    vc = float(row.get('vehicle_count') or 0.0)
+                    sp = float(row.get('average_speed') or 0.0)
+                    coords = (row.get('location_coordinates') or '').strip().strip('"')
+                    lat_str, lon_str = coords.split(',') if ',' in coords else (None, None)
+                    if not lat_str or not lon_str:
+                        continue
+                    lat, lon = float(lat_str), float(lon_str)
+                    # derive hour and weekday from timestamp
+                    dt = datetime.fromisoformat(ts)
+                    TRAFFIC_DATA.append({
+                        'ts': dt,
+                        'hour': dt.hour,
+                        'weekday': dt.weekday(),
+                        'lat': lat,
+                        'lon': lon,
+                        'speed': sp,
+                        'vehicles': vc,
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        TRAFFIC_DATA = []
+
+def _predict_speed(lat: float, lon: float, when: datetime) -> float:
+    # Simple spatiotemporal KNN with inverse-distance weighting + hour proximity
+    if not TRAFFIC_DATA:
+        return 30.0  # km/h fallback
+    # parameters
+    max_neighbors = 50
+    spatial_radius_m = 3000.0  # 3 km
+    hour = when.hour
+    wd = when.weekday()
+    neighbors = []
+    for rec in TRAFFIC_DATA:
+        if abs(rec['weekday'] - wd) > 6:  # not needed, but keep structure
+            pass
+        hdist = min(abs(rec['hour'] - hour), 24 - abs(rec['hour'] - hour))
+        # prefer same part of day
+        hour_w = 1.0 + (max(0, 6 - hdist) / 6.0)
+        d = _haversine_m(lat, lon, rec['lat'], rec['lon'])
+        if d <= spatial_radius_m:
+            neighbors.append((d, hour_w, rec['speed']))
+    if not neighbors:
+        # fallback to global median
+        try:
+            speeds = sorted([rec['speed'] for rec in TRAFFIC_DATA if rec['speed'] > 0])
+            return float(speeds[len(speeds)//2]) if speeds else 30.0
+        except Exception:
+            return 30.0
+    neighbors.sort(key=lambda t: t[0])
+    neighbors = neighbors[:max_neighbors]
+    # inverse distance weighting with hour weight
+    num = 0.0
+    den = 0.0
+    for d, hw, sp in neighbors:
+        w = (hw) * (1.0 / max(1.0, d))
+        num += w * sp
+        den += w
+    return max(5.0, num / den) if den > 0 else 30.0
+
+def _predict_route_time_seconds(coords: List[Dict[str, float]], when_iso: Optional[str]) -> float:
+    if not coords or len(coords) < 2:
+        return 0.0
+    when = None
+    try:
+        when = datetime.fromisoformat(when_iso) if when_iso else datetime.utcnow()
+    except Exception:
+        when = datetime.utcnow()
+    total_sec = 0.0
+    for i in range(len(coords)-1):
+        a = coords[i]; b = coords[i+1]
+        seg_m = _haversine_m(a['lat'], a['lng'], b['lat'], b['lng']) if 'lng' in a else _haversine_m(a['lat'], a['lon'], b['lat'], b['lon'])
+        mid_lat = 0.5 * (a['lat'] + b['lat'])
+        mid_lon = 0.5 * ((a.get('lng', a.get('lon'))) + (b.get('lng', b.get('lon'))))
+        sp_kmh = _predict_speed(mid_lat, mid_lon, when)
+        sp_ms = max(0.5, sp_kmh / 3.6)
+        total_sec += (seg_m / sp_ms)
+    return total_sec
+
+# Load traffic data at startup
+_load_traffic_csv()
 
 # Alerts config and state
 CONFIG: Dict[str, float] = {
@@ -405,22 +511,24 @@ async def list_demo_videos():
     # Hardcode geotags for first 4 videos (static, non-randomized)
     try:
         presets = [
-            ("Secunderabad Railway Station", 17.4399, 78.4983),
-            ("Uppal", 17.4056, 78.5596),
+            ("Secunderabad railway station", 17.4399, 78.4983),
             ("Marredpally", 17.4479, 78.5029),
             ("Nagole", 17.3693, 78.5609),
+            ("Charminar", 17.3850, 78.4867),
         ]
         for i, (lid, lat, lon) in enumerate(presets):
             if i >= len(items):
                 break
             fname = items[i]["filename"]
             cfg = LOCATION_CONFIGS.get(fname, {})
+            # Only set defaults if user hasn't set them yet
             if "location_id" not in cfg: cfg["location_id"] = lid
             if "area_m2" not in cfg: cfg["area_m2"] = 1000.0
             if "roi" not in cfg: cfg["roi"] = []
             if "lat" not in cfg: cfg["lat"] = float(lat)
             if "lon" not in cfg: cfg["lon"] = float(lon)
             LOCATION_CONFIGS[fname] = cfg
+        # Do not delete any existing user-defined locations
         _save_locations()
     except Exception:
         pass
@@ -438,13 +546,10 @@ async def list_all_sources():
         pass
     try:
         spots = [
+            (17.4399, 78.4983, "Secunderabad railway station"),
+            (17.4479, 78.5029, "Marredpally"),
+            (17.3693, 78.5609, "Nagole"),
             (17.3850, 78.4867, "Charminar"),
-            (17.4435, 78.3772, "HITEC City"),
-            (17.4399, 78.4983, "Secunderabad Junction"),
-            (17.4156, 78.4747, "Tank Bund"),
-            (17.4566, 78.5010, "Begumpet"),
-            (17.4933, 78.3996, "KPHB"),
-            (17.3566, 78.5570, "LB Nagar"),
         ]
         # Build a set of already-used coords to avoid duplicates
         used = set()
@@ -455,6 +560,7 @@ async def list_all_sources():
                     used.add((float(la), float(lo)))
             except Exception:
                 pass
+        assigned = 0
         for i, b in enumerate(blobs or []):
             fname = b.get("filename") if isinstance(b, dict) else None
             if not fname:
@@ -478,6 +584,9 @@ async def list_all_sources():
                 }
                 used.add((float(lat), float(lon)))
                 _save_locations()
+                assigned += 1
+                if assigned >= 4:
+                    break
     except Exception:
         pass
     return JSONResponse({"local": local, "blob": blobs})
@@ -613,13 +722,10 @@ def _stream_overlay(path: str, frame_stride: int = 2, resize_width: int = 960):
     cfg = LOCATION_CONFIGS.get(filename)
     if not cfg:
         spots = [
+            (17.4399, 78.4983, "Secunderabad railway station"),
+            (17.4479, 78.5029, "Marredpally"),
+            (17.3693, 78.5609, "Nagole"),
             (17.3850, 78.4867, "Charminar"),
-            (17.4435, 78.3772, "HITEC City"),
-            (17.4399, 78.4983, "Secunderabad Junction"),
-            (17.4156, 78.4747, "Tank Bund"),
-            (17.4566, 78.5010, "Begumpet"),
-            (17.4933, 78.3996, "KPHB"),
-            (17.3566, 78.5570, "LB Nagar"),
         ]
         idx = _stable_index(filename, len(spots))
         lat, lon, lid = spots[idx]
@@ -850,19 +956,43 @@ async def stream_demo_video(filename: str, frame_stride: int = 2):
                 pass
     return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
+@app.post("/ml/score_route")
+async def score_route(body: Dict[str, object]):
+    coords = body.get('path') if isinstance(body, dict) else None
+    when = body.get('timestamp') if isinstance(body, dict) else None
+    if not isinstance(coords, list) or len(coords) < 2:
+        raise HTTPException(status_code=400, detail="path must be an array of coordinates with lat and lng/lon")
+    # normalize coords
+    norm = []
+    for p in coords:
+        try:
+            lat = float(p.get('lat'))
+            lng = float(p.get('lng', p.get('lon')))
+            norm.append({'lat': lat, 'lng': lng})
+        except Exception:
+            continue
+    if len(norm) < 2:
+        raise HTTPException(status_code=400, detail="insufficient coordinates after normalization")
+    # decimate to max 200 points to limit CPU
+    try:
+        stride = max(1, len(norm) // 200)
+        if stride > 1:
+            norm = norm[::stride] + [norm[-1]]
+    except Exception:
+        pass
+    # offload computation to a worker thread to avoid blocking streaming generator
+    total_sec = await asyncio.to_thread(_predict_route_time_seconds, norm, when if isinstance(when, str) else None)
+    return JSONResponse({"predicted_time_seconds": round(float(total_sec), 2)})
+
 @app.get("/dashboard")
 async def dashboard():
     html = """
     <!doctype html>
     <html>
     <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>Crowd Safety Dashboard</title>
-      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-      <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+      <meta charset=\"utf-8\" />
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+      <title>Crowd Demo Dashboard</title>
       <style>
         body { font-family: system-ui, sans-serif; margin: 20px; }
         #list { margin-bottom: 12px; }
@@ -876,12 +1006,10 @@ async def dashboard():
         .sev-safe { color: #1a7f37; }
         .sev-moderate { color: #b58900; }
         .sev-critical { color: #d73a49; }
-        .legend { position: absolute; bottom: 12px; right: 12px; background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 6px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-        .legend .bar { width: 160px; height: 12px; background: linear-gradient(to right, #00bcd4, #8bc34a, #ffeb3b, #ff9800, #d32f2f); border-radius: 4px; margin: 6px 0; }
-        .legend .lbl { display: flex; justify-content: space-between; }
       </style>
       <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
       <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
       <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
       <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
     </head>
@@ -891,9 +1019,8 @@ async def dashboard():
       <div id="list">Loading...</div>
       <div id="controls">
         <label>Frame stride: <input id="stride" type="number" value="2" min="1" max="10" /></label>
-        <button id="start">Start Selected (max 3)</button>
+        <button id="start">Start Selected</button>
         <button id="stop">Stop All</button>
-        <label style="margin-left:10px;">Heatmap <input type="checkbox" id="heatToggle" checked /></label>
         <button id="useLoc">Select Current Location</button>
         <input id="uloc" type="text" placeholder="Enter location (e.g., Secunderabad Station)" style="width:280px;" />
         <button id="geocode">Locate</button>
@@ -902,7 +1029,7 @@ async def dashboard():
         <label style="margin-left:10px;">🔊 Voice Guidance <input type="checkbox" id="voiceToggle" /></label>
         <label style="margin-left:8px;">Lang <select id="voiceLang" style="min-width:120px;"></select></label>
         <label style="margin-left:8px;">Rate <input id="voiceRate" type="range" min="0.5" max="1.5" step="0.1" value="1.0" /></label>
-        <label style="margin-left:8px;">Step-by-step <input id="voiceStep" type="checkbox" checked /></label>
+        <label style="margin-left:8px;">Step-by-step <input type="checkbox" id="voiceStep" checked /></label>
         <button id="voiceRepeat" type="button">Repeat</button>
         <button id="voiceStop" type="button">Stop Voice</button>
         <button id="avoidBtn" style="display:none;background:#c62828;color:#fff;">Avoid Crowds</button>
@@ -910,11 +1037,7 @@ async def dashboard():
         <input id="dest" type="text" placeholder="Enter destination" style="width:280px;margin-top:6px;" />
         <button id="routeBtn">Route to Destination</button>
       </div>
-      <div class="grid">
-        <div class="panel"><h4 id="t1">Panel 1</h4><img id="p1" src="" alt="panel1" /></div>
-        <div class="panel"><h4 id="t2">Panel 2</h4><img id="p2" src="" alt="panel2" /></div>
-        <div class="panel"><h4 id="t3">Panel 3</h4><img id="p3" src="" alt="panel3" /></div>
-      </div>
+      <div class="grid" id="grid"></div>
 
       <h3>Live Congestion Map (OSM + OSRM)</h3>
       <div id="map"></div>
@@ -934,7 +1057,21 @@ async def dashboard():
             const row = document.createElement('div');
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = id; cb.value = v.filename;
             const lab = document.createElement('label'); lab.setAttribute('for', id); lab.textContent = v.filename;
-            row.appendChild(cb); row.appendChild(lab);
+            const gi = document.createElement('input'); gi.type = 'text'; gi.placeholder = 'Type location to geotag'; gi.style.marginLeft = '8px'; gi.size = 28;
+            const gb = document.createElement('button'); gb.textContent = 'Set Geotag'; gb.style.marginLeft = '6px';
+            gb.onclick = async () => {
+              const q = (gi.value || '').trim();
+              if(!q){ alert('Enter a location'); return; }
+              try{
+                const res = await geocodeOnce(q);
+                const payload = { filename: v.filename, lat: res.lat, lon: res.lon, location_id: q };
+                const r = await fetch('/locations/geotag', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if(!r.ok){ throw new Error('server rejected'); }
+                locationsCache[v.filename] = Object.assign(locationsCache[v.filename]||{}, { lat: res.lat, lon: res.lon, location_id: q });
+                alert('Geotag updated');
+              }catch(e){ alert('Failed to set geotag'); }
+            };
+            row.appendChild(cb); row.appendChild(lab); row.appendChild(gi); row.appendChild(gb);
             list.appendChild(row);
           });
           try {
@@ -942,36 +1079,78 @@ async def dashboard():
             const lj = await lr.json();
             locationsCache = lj.locations || {};
           } catch(e) { locationsCache = {}; }
-          // Auto-start: select first up to 3 and start streaming
+          // Auto-start: select all and start streaming
           try {
-            const cbs = Array.from(document.querySelectorAll('#list input[type=checkbox]')).slice(0,3);
+            const cbs = Array.from(document.querySelectorAll('#list input[type=checkbox]'));
             cbs.forEach(cb => cb.checked = true);
             setTimeout(startSelected, 200);
-          } catch(_){ }
+          } catch(_) { }
         }
 
         function stopAll() {
-          ['p1','p2','p3'].forEach(id => { document.getElementById(id).src = ''; });
-          ['t1','t2','t3'].forEach(id => { document.getElementById(id).textContent = 'Panel'; });
+          const grid = document.getElementById('grid');
+          if (grid) { grid.innerHTML = ''; }
         }
 
-        function startSelected() {
+        let rotateTimer = null;
+        const ROTATE_COUNT = 3;
+        const ROTATE_MS = 20000; // 20s per rotation
+
+        function rotateStop(){ if(rotateTimer){ clearInterval(rotateTimer); rotateTimer = null; } }
+
+        function stopAll() {
+          rotateStop();
+          const grid = document.getElementById('grid');
+          if (grid) { grid.innerHTML = ''; }
+        }
+
+        function startSelected(offset=0) {
           stopAll();
           const s = document.getElementById('stride').value || 2;
-          const checked = Array.from(document.querySelectorAll('#list input[type=checkbox]:checked')).slice(0,3);
-          const panels = [ ['p1','t1'], ['p2','t2'], ['p3','t3'] ];
-          checked.forEach((c, idx) => {
-            const [imgId, tId] = panels[idx];
-            document.getElementById(imgId).src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s;
-            document.getElementById(tId).textContent = c.value;
-          });
+          const all = Array.from(document.querySelectorAll('#list input[type=checkbox]:checked'));
+          const grid = document.getElementById('grid');
+          if(all.length === 0){ return; }
+          const n = Math.min(ROTATE_COUNT, all.length);
+          for(let i=0;i<n;i++){
+            const c = all[(offset + i) % all.length];
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+            const title = document.createElement('h4');
+            title.textContent = c.value;
+            const img = document.createElement('img');
+            img.alt = c.value;
+            img.src = '/videos/stream?filename=' + encodeURIComponent(c.value) + '&frame_stride=' + s;
+            panel.appendChild(title);
+            panel.appendChild(img);
+            grid.appendChild(panel);
+          }
+          // start rotation
+          let k = offset;
+          rotateTimer = setInterval(() => {
+            k = (k + ROTATE_COUNT) % all.length;
+            startSelected(k);
+          }, ROTATE_MS);
+        }
 
-          // Pan map to selected locations and open popups once markers are ready
-          const pts = [];
+        // Pan map to selected locations and open popups once markers are ready
+        const pts = [];
+        checked.forEach(c => {
+          const cfg = locationsCache[c.value];
+          if(cfg && typeof cfg.lat === 'number' && typeof cfg.lon === 'number'){
+            pts.push([cfg.lat, cfg.lon]);
+          }
+        });
+        if(pts.length === 1){ map.flyTo(pts[0], 14); }
+        if(pts.length > 1){
+          const b = L.latLngBounds(pts.map(p => L.latLng(p[0], p[1])));
+          map.fitBounds(b.pad(0.2));
+        }
+        // Try to open the popups shortly after, when markers exist
+        setTimeout(() => {
           checked.forEach(c => {
-            const cfg = locationsCache[c.value];
-            if(cfg && typeof cfg.lat === 'number' && typeof cfg.lon === 'number'){
-              pts.push([cfg.lat, cfg.lon]);
+            const key = c.value;
+            if(markers.has(key)){
+              markers.get(key).marker.openPopup();
             }
           });
           if(pts.length === 1){ map.flyTo(pts[0], 14); }
@@ -1038,48 +1217,8 @@ async def dashboard():
         let router = null;
         let selected = [];
         let locationsCache = {};
-        // Heatmap layer for live crowd density (AI emphasis on high risk)
-        let heatLayer = L.heatLayer([], {
-          radius: 28,
-          blur: 18,
-          maxZoom: 19,
-          gradient: {
-            0.0: '#00bcd4', // low
-            0.4: '#8bc34a', // safe
-            0.6: '#ffeb3b', // watch
-            0.8: '#ff9800', // elevated
-            1.0: '#d32f2f'  // high (red)
-          }
-        });
-        if(document.getElementById('heatToggle').checked){ heatLayer.addTo(map); }
-        document.getElementById('heatToggle').addEventListener('change', (e)=>{
-          try{
-            if(e.target.checked){ heatLayer.addTo(map); }
-            else { map.removeLayer(heatLayer); }
-          }catch(_){ }
-        });
-        // Legend control
-        const legend = L.control({position:'bottomright'});
-        legend.onAdd = function(){
-          const div = L.DomUtil.create('div', 'legend');
-          div.innerHTML = '<div><b>Crowd Risk</b></div>'+
-                          '<div class="bar"></div>'+
-                          '<div class="lbl"><span>Low</span><span>High</span></div>';
-          return div;
-        };
-        legend.addTo(map);
-        // Density threshold (for intensity scaling), pulled from backend config
-        let densityThreshold = 12.0;
-        async function loadConfigHeat(){
-          try{
-            const r = await fetch('/alerts/config');
-            if(!r.ok) return;
-            const j = await r.json();
-            const cfg = j && j.config ? j.config : {};
-            if(typeof cfg.density_threshold === 'number') densityThreshold = cfg.density_threshold;
-          }catch(_){ }
-        }
-        loadConfigHeat(); setInterval(loadConfigHeat, 60000);
+        // Heatmap layer for live crowd severity
+        let heatLayer = null;
         let userMarker = null;
         let userCircle = null;
         let pickMode = false;
@@ -1183,7 +1322,7 @@ async def dashboard():
 
         // Load persisted settings/state after DOM is ready
         loadVoiceSettings();
-        loadUserLoc();
+        // Do not auto-set user location; wait for explicit user action
         loadDest();
 
         function speak(text){
@@ -1335,6 +1474,36 @@ async def dashboard():
         }
 
         let rerouteGuard = false;
+        async function scoreRouteML(route){
+          try{
+            const path = (route.coordinates||[]).map(p => ({ lat: p.lat, lng: p.lng }));
+            const body = { path, timestamp: new Date().toISOString() };
+            const r = await fetch('/ml/score_route', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            if(!r.ok) throw new Error('ml score failed');
+            const j = await r.json();
+            return typeof j.predicted_time_seconds === 'number' ? j.predicted_time_seconds : Infinity;
+          }catch(_){ return Infinity; }
+        }
+
+        async function selectBestAlternative(router, e){
+          try{
+            const routes = e && e.routes ? e.routes : [];
+            if(!routes.length) return;
+            // Score all alternatives
+            const scores = await Promise.all(routes.map(rt => scoreRouteML(rt)));
+            let bestIdx = 0;
+            for(let i=1;i<scores.length;i++){ if(scores[i] < scores[bestIdx]) bestIdx = i; }
+            // If best is not first, select it
+            if(bestIdx !== 0){
+              try{ if(typeof router._selectRoute === 'function'){ router._selectRoute(routes[bestIdx]); } }catch(_){ }
+              // speak summary for selected route
+              const best = routes[bestIdx];
+              const min = Math.round((scores[bestIdx]||0)/60);
+              if(best && best.summary){ speak(`Optimized route selected. Estimated time ${min} minutes.`); }
+            }
+          }catch(_){ }
+        }
+
         function createRouterWithSafety(waypoints){
           if(router){ map.removeControl(router); router=null; }
           router = L.Routing.control({
@@ -1342,11 +1511,28 @@ async def dashboard():
             routeWhileDragging: false,
             addWaypoints: false,
             draggableWaypoints: false,
+            showAlternatives: true,
+            router: L.Routing.osrmv1({
+              serviceUrl: 'https://router.project-osrm.org/route/v1',
+              profile: 'car',
+              alternatives: 3,
+            }),
+            lineOptions: {
+              styles: [
+                { color: '#2ecc71', opacity: 0.9, weight: 6 }, // main: green
+                { color: '#27ae60', opacity: 0.6, weight: 8 }
+              ]
+            },
+            altLineOptions: {
+              styles: [
+                { color: '#9e9e9e', opacity: 0.7, weight: 5, dashArray: '6,6' } // alternatives: grey dashed
+              ]
+            },
             createMarker: () => null,
           }).addTo(map);
           lastWaypoints = waypoints.slice();
           attachVoice(router);
-          router.on('routesfound', (e) => {
+          router.on('routesfound', async (e) => {
             try{
               const route = e.routes && e.routes[0];
               if(!route) return;
@@ -1359,7 +1545,10 @@ async def dashboard():
                 const detour = computeDetourWaypoint(u, d, crit);
                 if(detour){ createRouterWithSafety([ L.latLng(u.lat, u.lng), detour, L.latLng(d.lat, d.lng) ]); }
                 setTimeout(() => { rerouteGuard = false; }, 1000);
+                return;
               }
+              // If route is safe, pick best alternative using ML scoring
+              await selectBestAlternative(router, e);
             }catch(_){ /* ignore */ }
           });
         }
@@ -1391,26 +1580,23 @@ async def dashboard():
             const j = await r.json();
             if(!j.items) return;
             const heat = [];
-            // If neither user nor destination is set, hide all markers.
-            if(!userMarker && !destMarker){
-              if(markers.size){
-                markers.forEach(({ marker }) => { map.removeLayer(marker); });
-                markers.clear();
-              }
-              heatLayer.setLatLngs([]);
-              setTimeout(poll, 3000);
-              return;
-            }
             const u = userMarker ? userMarker.getLatLng() : null;
             const dLL = destMarker ? destMarker.getLatLng() : null;
+            const showAll = !userMarker; // before user location, show all markers
             j.items.forEach(it => {
               if(typeof it.lat !== 'number' || typeof it.lon !== 'number') return;
               const key = it.filename;
               const mll = L.latLng(it.lat, it.lon);
-              let inRange = false;
-              if(u){ inRange = inRange || (map.distance(mll, u) <= USER_RADIUS_METERS); }
-              if(dLL){ inRange = inRange || (map.distance(mll, dLL) <= USER_RADIUS_METERS); }
-              if(!inRange){
+              const sev = (it.severity||'').toString().toUpperCase();
+              const inRangeUser = u ? (map.distance(mll, u) <= USER_RADIUS_METERS) : false;
+              const inRangeDest = dLL ? (map.distance(mll, dLL) <= USER_RADIUS_METERS) : false;
+              const inRange = (u || dLL) ? (inRangeUser || inRangeDest) : true;
+              const crowded = sev !== 'SAFE';
+              const shouldShow = showAll ? true : (inRange && crowded);
+              // Heat intensity by severity (always contribute to overview)
+              const intensity = sev === 'CRITICAL' ? 1.0 : (sev === 'MODERATE' ? 0.6 : 0.25);
+              heat.push([it.lat, it.lon, intensity]);
+              if(!shouldShow){
                 if(markers.has(key)){
                   const { marker } = markers.get(key);
                   map.removeLayer(marker);
@@ -1418,11 +1604,7 @@ async def dashboard():
                 }
                 return;
               }
-              // Accumulate heatmap intensity from predicted or current density
-              const dens = (typeof it.pred_density_mp === 'number' ? it.pred_density_mp : (typeof it.density_mp === 'number' ? it.density_mp : (typeof it.density_now === 'number' ? it.density_now : 0)));
-              const denom = (typeof CONFIG !== 'undefined' && CONFIG && typeof CONFIG.density_threshold === 'number') ? (CONFIG.density_threshold * 1.5) : 18.0;
-              const intensity = Math.max(0, Math.min(1, (Number(dens)||0) / (denom||18.0)));
-              heat.push([it.lat, it.lon, intensity]);
+
               const html = `<b>${it.location_id || key}</b><br/>`+
                 `<span class="${sevClass(it.severity)}">${it.severity}</span><br/>`+
                 `Count: ${it.count}<br/>`+
@@ -1454,9 +1636,6 @@ async def dashboard():
                 markers.set(key, { marker });
               }
             });
-            // Update heat layer after processing items
-            try{ heatLayer.setLatLngs(heat); }catch(_){ }
-
             // Dynamic re-route if new CRITICAL markers appear along current route
             if(router && lastWaypoints && lastRouteCoords && userMarker){
               try{
@@ -1572,7 +1751,6 @@ async def dashboard():
             (pos) => {
               const { latitude, longitude, accuracy } = pos.coords;
               placeUser(latitude, longitude, accuracy);
-              startGeoWatch();
             },
             (err) => { alert('Failed to get location: ' + err.message); },
             { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
@@ -1613,7 +1791,6 @@ async def dashboard():
             if(destCircle){ destCircle.setLatLng([dest.lat, dest.lon]); destCircle.setRadius(USER_RADIUS_METERS); }
             else { destCircle = L.circle([dest.lat, dest.lon], { radius: USER_RADIUS_METERS, color: '#1976d2', weight: 2, opacity: 0.9, dashArray: '6 8', fillOpacity: 0, interactive: false }).addTo(map); }
             saveDest(dest.lat, dest.lon, dest.name);
-            startGeoWatch();
           }catch(e){ alert('Failed to route to destination: ' + e.message); }
         };
 
@@ -1771,14 +1948,20 @@ async def set_location(
     return JSONResponse({"ok": True, "config": LOCATION_CONFIGS[filename]})
 
 @app.post("/locations/geotag")
-async def geotag_location(filename: str = Body(...), lat: float = Body(...), lon: float = Body(...)):
+async def geotag_location(filename: str = Body(...), lat: float = Body(...), lon: float = Body(...), location_id: Optional[str] = Body(None)):
     if not filename:
         raise HTTPException(status_code=400, detail="filename required")
     if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
         raise HTTPException(status_code=400, detail="lat/lon must be numbers")
     cfg = LOCATION_CONFIGS.get(filename, {"location_id": filename, "area_m2": 0.0, "roi": []})
     cfg["lat"], cfg["lon"] = float(lat), float(lon)
+    if location_id:
+        cfg["location_id"] = str(location_id)
     LOCATION_CONFIGS[filename] = cfg
+    try:
+        _save_locations()
+    except Exception:
+        pass
     return JSONResponse({"ok": True, "config": cfg})
 
 @app.delete("/locations/delete")
