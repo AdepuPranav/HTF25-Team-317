@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Crowd Safety Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+  <!-- Leaflet + Heatmap -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .panel { border: 1px solid #ddd; border-radius: 6px; padding: 8px; }
+    #map { height: 420px; border: 1px solid #ddd; border-radius: 6px; margin-top: 16px; }
+    .legend { position: absolute; bottom: 12px; right: 12px; background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 6px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+    .legend .bar { width: 160px; height: 12px; background: linear-gradient(to right, #00bcd4, #8bc34a, #ffeb3b, #ff9800, #d32f2f); border-radius: 4px; margin: 6px 0; }
+    .legend .lbl { display: flex; justify-content: space-between; }
+  </style>
+</head>
+<body>
+  <h2>Crowd Safety Dashboard</h2>
+
+  <div id="videos" class="grid"></div>
+
+  <h3>Predictive Insights</h3>
+  <div id="insights" class="grid"></div>
+
+  <h3>Live Heatmap</h3>
+  <div id="map"></div>
+
+<script>
+/* Configure your FastAPI origin here:
+   - If Django runs on a different port than FastAPI, set BASE to the FastAPI URL.
+   - If you reverse-proxy both under one domain, keep BASE = ''.
+*/
+const BASE = 'http://localhost:8000'; // FastAPI base URL
+
+async function loadVideos(){
+  const r = await fetch(`${BASE}/videos/demo`);
+  const j = await r.json();
+  const wrap = document.getElementById('videos');
+  wrap.innerHTML = '';
+  (j.videos||[]).slice(0,3).forEach(v=>{
+    const d = document.createElement('div'); d.className='panel';
+    d.innerHTML = `<div style="font-weight:600;margin:6px 0">${v.filename}</div>`;
+    const img = document.createElement('img'); img.style.width='100%';
+    img.src = `${BASE}/videos/stream?filename=${encodeURIComponent(v.filename)}&frame_stride=2`;
+    img.alt = v.filename;
+    d.appendChild(img);
+    wrap.appendChild(d);
+  });
+}
+
+async function loadInsights(){
+  const r = await fetch(`${BASE}/predict_insight?horizon=30&window=30`);
+  const j = await r.json();
+  const wrap = document.getElementById('insights'); wrap.innerHTML='';
+  (j.items||[]).forEach(it=>{
+    const d = document.createElement('div'); d.className='panel';
+    d.innerHTML = `<b>${it.filename}</b>
+      <div style="margin-top:6px">${(it.insights||[]).map(s=>`<div>${s}</div>`).join('')}</div>
+      <div style="margin-top:6px;font-size:12px;color:#666">Sev now: ${it.severity_now} → future: ${it.severity_future}</div>`;
+    wrap.appendChild(d);
+  });
+}
+
+let map, heat;
+function initMap(){
+  map = L.map('map').setView([20.5937, 78.9629], 5);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    maxZoom:19, attribution:'© OpenStreetMap'
+  }).addTo(map);
+  heat = L.heatLayer([], {
+    radius: 28, blur: 18, maxZoom: 19,
+    gradient: {0.0:'#00bcd4',0.4:'#8bc34a',0.6:'#ffeb3b',0.8:'#ff9800',1.0:'#d32f2f'}
+  }).addTo(map);
+  const legend = L.control({position:'bottomright'});
+  legend.onAdd = function(){
+    const div = L.DomUtil.create('div', 'legend');
+    div.innerHTML = '<div><b>Crowd Risk</b></div><div class="bar"></div><div class="lbl"><span>Low</span><span>High</span></div>';
+    return div;
+  }; legend.addTo(map);
+}
+
+async function pollHeat(){
+  try{
+    const cfg = await fetch(`${BASE}/alerts/config`).then(r=>r.json()).catch(()=>({}));
+    const thr = cfg?.config?.density_threshold || 12;
+    const denom = Math.max(1, thr*1.5);
+    const r = await fetch(`${BASE}/congestion?include_idle=0`); const j = await r.json();
+    const pts = (j.items||[]).filter(it=>typeof it.lat==='number'&&typeof it.lon==='number').map(it=>{
+      const dens = (typeof it.pred_density_mp==='number')?it.pred_density_mp:(typeof it.density_mp==='number')?it.density_mp:(it.density_now||0);
+      let intensity = Math.max(0, Math.min(1, (Number(dens)||0)/denom));
+      const sev = `${it.severity||''}`.toUpperCase();
+      if(sev==='CRITICAL') intensity = Math.min(1, intensity*1.4);
+      else if(sev==='MODERATE') intensity = Math.min(1, intensity*1.1);
+      return [it.lat, it.lon, intensity];
+    });
+    heat.setLatLngs(pts);
+  }catch(e){}
+  setTimeout(pollHeat, 3000);
+}
+
+(async function(){
+  initMap();
+  await loadVideos();
+  await loadInsights();
+  setInterval(loadInsights, 2000);
+  pollHeat();
+})();
+</script>
+</body>
+</html>

@@ -856,9 +856,13 @@ async def dashboard():
     <!doctype html>
     <html>
     <head>
-      <meta charset=\"utf-8\" />
-      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-      <title>Crowd Demo Dashboard</title>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Crowd Safety Dashboard</title>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
       <style>
         body { font-family: system-ui, sans-serif; margin: 20px; }
         #list { margin-bottom: 12px; }
@@ -872,6 +876,9 @@ async def dashboard():
         .sev-safe { color: #1a7f37; }
         .sev-moderate { color: #b58900; }
         .sev-critical { color: #d73a49; }
+        .legend { position: absolute; bottom: 12px; right: 12px; background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 6px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        .legend .bar { width: 160px; height: 12px; background: linear-gradient(to right, #00bcd4, #8bc34a, #ffeb3b, #ff9800, #d32f2f); border-radius: 4px; margin: 6px 0; }
+        .legend .lbl { display: flex; justify-content: space-between; }
       </style>
       <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
       <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -886,6 +893,7 @@ async def dashboard():
         <label>Frame stride: <input id="stride" type="number" value="2" min="1" max="10" /></label>
         <button id="start">Start Selected (max 3)</button>
         <button id="stop">Stop All</button>
+        <label style="margin-left:10px;">Heatmap <input type="checkbox" id="heatToggle" checked /></label>
         <button id="useLoc">Select Current Location</button>
         <input id="uloc" type="text" placeholder="Enter location (e.g., Secunderabad Station)" style="width:280px;" />
         <button id="geocode">Locate</button>
@@ -1030,6 +1038,48 @@ async def dashboard():
         let router = null;
         let selected = [];
         let locationsCache = {};
+        // Heatmap layer for live crowd density (AI emphasis on high risk)
+        let heatLayer = L.heatLayer([], {
+          radius: 28,
+          blur: 18,
+          maxZoom: 19,
+          gradient: {
+            0.0: '#00bcd4', // low
+            0.4: '#8bc34a', // safe
+            0.6: '#ffeb3b', // watch
+            0.8: '#ff9800', // elevated
+            1.0: '#d32f2f'  // high (red)
+          }
+        });
+        if(document.getElementById('heatToggle').checked){ heatLayer.addTo(map); }
+        document.getElementById('heatToggle').addEventListener('change', (e)=>{
+          try{
+            if(e.target.checked){ heatLayer.addTo(map); }
+            else { map.removeLayer(heatLayer); }
+          }catch(_){ }
+        });
+        // Legend control
+        const legend = L.control({position:'bottomright'});
+        legend.onAdd = function(){
+          const div = L.DomUtil.create('div', 'legend');
+          div.innerHTML = '<div><b>Crowd Risk</b></div>'+
+                          '<div class="bar"></div>'+
+                          '<div class="lbl"><span>Low</span><span>High</span></div>';
+          return div;
+        };
+        legend.addTo(map);
+        // Density threshold (for intensity scaling), pulled from backend config
+        let densityThreshold = 12.0;
+        async function loadConfigHeat(){
+          try{
+            const r = await fetch('/alerts/config');
+            if(!r.ok) return;
+            const j = await r.json();
+            const cfg = j && j.config ? j.config : {};
+            if(typeof cfg.density_threshold === 'number') densityThreshold = cfg.density_threshold;
+          }catch(_){ }
+        }
+        loadConfigHeat(); setInterval(loadConfigHeat, 60000);
         let userMarker = null;
         let userCircle = null;
         let pickMode = false;
@@ -1340,12 +1390,14 @@ async def dashboard():
             const r = await fetch('/congestion?include_idle=0');
             const j = await r.json();
             if(!j.items) return;
+            const heat = [];
             // If neither user nor destination is set, hide all markers.
             if(!userMarker && !destMarker){
               if(markers.size){
                 markers.forEach(({ marker }) => { map.removeLayer(marker); });
                 markers.clear();
               }
+              heatLayer.setLatLngs([]);
               setTimeout(poll, 3000);
               return;
             }
@@ -1366,6 +1418,11 @@ async def dashboard():
                 }
                 return;
               }
+              // Accumulate heatmap intensity from predicted or current density
+              const dens = (typeof it.pred_density_mp === 'number' ? it.pred_density_mp : (typeof it.density_mp === 'number' ? it.density_mp : (typeof it.density_now === 'number' ? it.density_now : 0)));
+              const denom = (typeof CONFIG !== 'undefined' && CONFIG && typeof CONFIG.density_threshold === 'number') ? (CONFIG.density_threshold * 1.5) : 18.0;
+              const intensity = Math.max(0, Math.min(1, (Number(dens)||0) / (denom||18.0)));
+              heat.push([it.lat, it.lon, intensity]);
               const html = `<b>${it.location_id || key}</b><br/>`+
                 `<span class="${sevClass(it.severity)}">${it.severity}</span><br/>`+
                 `Count: ${it.count}<br/>`+
@@ -1397,6 +1454,9 @@ async def dashboard():
                 markers.set(key, { marker });
               }
             });
+            // Update heat layer after processing items
+            try{ heatLayer.setLatLngs(heat); }catch(_){ }
+
             // Dynamic re-route if new CRITICAL markers appear along current route
             if(router && lastWaypoints && lastRouteCoords && userMarker){
               try{

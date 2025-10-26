@@ -959,6 +959,91 @@ async def predict(filename: str | None = None, horizon: int | None = None, windo
         })
     return JSONResponse({"items": items, "horizon": h, "window": w})
 
+def _ema(y: List[float], alpha: float) -> List[float]:
+    out: List[float] = []
+    s = None
+    for v in y:
+        s = (alpha * v + (1 - alpha) * s) if s is not None else v
+        out.append(float(s))
+    return out
+
+def _insight_for_series(name: str, secs: List[int], dens: List[float], panic_vals: List[float], horizon: int, cfg: Dict[str, float]) -> Dict[str, object]:
+    density_thr = float(cfg.get("density_threshold", 12.0) or 12.0)
+    panic_thr = float(cfg.get("panic_threshold", 0.7) or 0.7)
+    alpha = float(cfg.get("ema_alpha", 0.2) or 0.2)
+    # Smoothed current values
+    dens_ema = _ema(dens, alpha) if dens else []
+    panic_ema = _ema(panic_vals, alpha) if panic_vals else []
+    now_d = dens_ema[-1] if dens_ema else (dens[-1] if dens else 0.0)
+    now_p = panic_ema[-1] if panic_ema else (panic_vals[-1] if panic_vals else 0.0)
+    # Forecasts via linear trend
+    dens_fc = _linear_forecast(dens, horizon)
+    panic_fc = _linear_forecast(panic_vals, horizon)
+    fut_d = dens_fc[-1] if dens_fc else now_d
+    fut_p = panic_fc[-1] if panic_fc else now_p
+    # Time-to-breach density
+    ttb = None
+    for i, d_hat in enumerate(dens_fc, start=1):
+        if d_hat >= density_thr:
+            ttb = i
+            break
+    # Panic label
+    def p_label(x: float) -> str:
+        if x < 0.3: return "low"
+        if x < 0.6: return "moderate"
+        return "high"
+    # Severity bucket
+    def sev_for(d: float, p: float) -> str:
+        sev_d = "high" if d >= 1.5 * density_thr else ("medium" if d >= density_thr else "low")
+        sev_p = "high" if p >= 0.8 else ("medium" if p >= 0.5 else "low")
+        order = {"low":0, "medium":1, "high":2}
+        return (sev_d if order[sev_d] >= order[sev_p] else sev_p)
+    sev_now = sev_for(now_d, now_p)
+    sev_fut = sev_for(fut_d, fut_p)
+    # Sentences
+    s1 = f"Right now, density = {now_d:.2f}/MP, predicted in {horizon} sec = {fut_d:.2f}/MP"
+    if ttb is not None:
+        s2 = f"Crowd likely to exceed safe limit ({density_thr:.2f}/MP) in {ttb} seconds"
+    else:
+        s2 = "Stable crowd flow expected (no threshold breach in horizon)"
+    s3 = (
+        "Panic level is low now, predicted to spike soon" if p_label(now_p)=="low" and p_label(fut_p)!="low"
+        else f"Panic is {p_label(now_p)} now, expected to stay {p_label(fut_p)}"
+    )
+    return {
+        "filename": name,
+        "severity_now": sev_now,
+        "severity_future": sev_fut,
+        "insights": [s1, s2, s3],
+        "now": {"density_mp": round(now_d,3), "panic": round(now_p,3)},
+        "future": {"density_mp": round(fut_d,3), "panic": round(fut_p,3)},
+        "horizon": horizon,
+        "thresholds": {"density_mp": density_thr, "panic": panic_thr}
+    }
+
+@app.get("/predict_insight")
+async def predict_insight(filename: str | None = None, horizon: int | None = None, window: int | None = None):
+    """Return text-based predictive insights per active stream.
+    Params:
+      - filename: optional target stream name. Defaults to all active.
+      - horizon: seconds ahead to forecast (default CONFIG.predict_horizon_sec)
+      - window: history window in seconds (default CONFIG.predict_window_sec)
+    """
+    h = int(horizon or CONFIG.get("predict_horizon_sec", 10) or 10)
+    w = int(window or CONFIG.get("predict_window_sec", 30) or 30)
+    targets = [filename] if filename else list(STREAM_HISTORY.keys())
+    out: List[Dict[str, object]] = []
+    for name in targets:
+        hist = STREAM_HISTORY.get(name)
+        if not hist:
+            continue
+        data = list(hist)[-w:]
+        secs = [int(d.get("second", 0)) for d in data]
+        dens = [float(d.get("density_mp", 0.0)) for d in data]
+        panic_vals = [float(d.get("panic", 0.0)) for d in data]
+        out.append(_insight_for_series(name, secs, dens, panic_vals, h, CONFIG))
+    return JSONResponse({"items": out, "horizon": h, "window": w})
+
 @app.post("/videos/analyze/seconds")
 async def analyze_per_second(filename: str, frame_stride: int = 5, detector: str = 'hog'):
     items = _list_demo_videos()
